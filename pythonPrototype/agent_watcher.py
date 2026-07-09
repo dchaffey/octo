@@ -93,17 +93,27 @@ class ShellActivity:
 
 
 @dataclass
+class PromptEvent:
+    """One newly observed human-typed prompt, used to close human autosave batches."""
+    timestamp: float
+    session_id: str
+    prompt: str
+    agent: str
+
+
+@dataclass
 class PollResult:
     """One tailer poll's findings: verified edits/moves ready for attribution, plus unverified
     shell activity markers the TUI renders as a hint only."""
     edits: list[ToolEdit]                # Edit/Write/NotebookEdit/apply_patch/rm calls, content-verified
     moves: list[ShellMoveEdit]             # mv/cp calls; verified later against shadow repo history
     shell_activity: list[ShellActivity]      # unparseable shell commands; annotation-only, no revert
+    prompt_events: list[PromptEvent]          # newly typed prompts; used only as human-batch boundaries
 
     @classmethod
     def empty(cls) -> "PollResult":
         """No findings -- the identity element absorb()/merge() accumulate into."""
-        return cls([], [], [])
+        return cls([], [], [], [])
 
     def absorb(self, other: "PollResult"):
         """Appends other's findings onto self in place; the mutable half of the merge pattern used
@@ -111,6 +121,7 @@ class PollResult:
         self.edits.extend(other.edits)
         self.moves.extend(other.moves)
         self.shell_activity.extend(other.shell_activity)
+        self.prompt_events.extend(other.prompt_events)
 
     @classmethod
     def merge(cls, results: list["PollResult"]) -> "PollResult":
@@ -127,6 +138,7 @@ class PollResult:
             edits=[e for e in self.edits if e.timestamp >= timestamp],
             moves=[m for m in self.moves if m.timestamp >= timestamp],
             shell_activity=[a for a in self.shell_activity if a.timestamp >= timestamp],
+            prompt_events=[p for p in self.prompt_events if p.timestamp >= timestamp],
         )
 
 
@@ -214,7 +226,7 @@ def _build_shell_poll_result(command: str, cwd: str, start_ts: float, end_ts: fl
     move_edits = [ShellMoveEdit(start_ts, session_id, prompt, agent, src, dst, src_removed)
                   for src, dst, src_removed in moves]
     activity = [] if fully_understood else [ShellActivity(start_ts, end_ts, session_id, agent, prompt, command)]
-    return PollResult(edits, move_edits, activity)
+    return PollResult(edits, move_edits, activity, [])
 
 
 def _parse_diff_hunks(unified_diff: str) -> list[tuple[str, str]]:
@@ -407,14 +419,19 @@ class ClaudeTranscriptTailer:
         if prompt_text is not None:
             self._last_prompt[session_id] = prompt_text
             self._prompt_history.setdefault(session_id, []).append((timestamp, prompt_text))
-            return PollResult.empty()  # a prompt line never itself contains a tool call
+            return PollResult(
+                [],
+                [],
+                [],
+                [PromptEvent(timestamp, session_id, prompt_text, "Claude")],
+            )  # a prompt line never itself contains a tool call
         if record.get("type") == "assistant":
             prompt = self._last_prompt.get(session_id, "")  # prompt in effect when this tool call happened
             edits = [ToolEdit(timestamp, edit_path, session_id, prompt, "Claude", content)
                      for edit_path, content in _extract_edits(record)]
             for tool_use_id, command in _extract_bash_calls(record):
                 self._pending_bash[tool_use_id] = (timestamp, command, session_id, prompt)
-            return PollResult(edits, [], [])
+            return PollResult(edits, [], [], [])
         return PollResult.merge([self._resolve_bash_result(tool_use_id, timestamp)
                                     for tool_use_id in _extract_tool_result_ids(record)])
 
@@ -534,6 +551,7 @@ class AntigravityTranscriptTailer:
         self._db_offsets: dict[str, int] = {}                # conversation_id -> last steps.idx consumed from its sqlite db
         self._jsonl_offsets: dict[Path, int] = {}              # transcript.jsonl path -> byte offset already consumed
         self._last_prompt: dict[str, str] = {}                   # conversation_id -> most recent human prompt text seen
+        self._pending_prompt_events: list[PromptEvent] = []       # prompt boundaries discovered in sqlite since the last poll
         self._prompt_extractor = AntigravityPromptExtractor()      # swappable strategy for recovering prompt text from raw step payloads
 
     @property
@@ -547,7 +565,10 @@ class AntigravityTranscriptTailer:
         if conversation_id is None:
             return PollResult.empty()  # no Antigravity session has ever run against this cwd
         self._absorb_new_prompts(conversation_id)
-        return self._read_new_tool_calls(conversation_id)
+        result = self._read_new_tool_calls(conversation_id)
+        result.prompt_events.extend(self._pending_prompt_events)
+        self._pending_prompt_events = []
+        return result
 
     def _active_conversation_id(self) -> str | None:
         """Looks up which conversation Antigravity last opened for self.cwd or its nearest ancestor.
@@ -608,6 +629,9 @@ class AntigravityTranscriptTailer:
                 prompt_text = self._prompt_extractor.extract(payload)
                 if prompt_text:
                     self._last_prompt[conversation_id] = prompt_text
+                    self._pending_prompt_events.append(
+                        PromptEvent(time.time(), conversation_id, prompt_text, "Antigravity")
+                    )
 
     def _read_new_tool_calls(self, conversation_id: str) -> PollResult:
         """Reads new lines from the conversation's readable transcript.jsonl and extracts file writes and rm/mv/cp shell calls."""
@@ -754,8 +778,14 @@ class CodexTranscriptTailer:
         payload = record.get("payload", {})  # event_msg payload carries the actual event type and data
         event_type = payload.get("type")
         if event_type == CODEX_USER_MESSAGE_EVENT:
-            self._last_prompt[path] = _extract_codex_prompt(payload.get("message", ""))
-            return PollResult.empty()  # a prompt line never itself contains a tool call
+            prompt = _extract_codex_prompt(payload.get("message", ""))
+            self._last_prompt[path] = prompt
+            return PollResult(
+                [],
+                [],
+                [],
+                [PromptEvent(_parse_timestamp(record.get("timestamp")), self._session_ids.get(path, ""), prompt, "Codex")],
+            )  # a prompt line never itself contains a tool call
         if event_type == CODEX_PATCH_EVENT and payload.get("success"):
             timestamp = _parse_timestamp(record.get("timestamp"))
             prompt = self._last_prompt.get(path, "")  # prompt in effect when this patch was applied
@@ -763,7 +793,7 @@ class CodexTranscriptTailer:
             changes = payload.get("changes", {})  # patch_apply_end.changes maps path -> change info
             edits = [ToolEdit(timestamp, p, session_id, prompt, "Codex", _codex_edit_content(change))
                      for p, change in changes.items()]
-            return PollResult(edits, [], [])
+            return PollResult(edits, [], [], [])
         return PollResult.empty()
 
     def _parse_response_item(self, path: Path, record: dict) -> PollResult:

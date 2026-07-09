@@ -484,6 +484,19 @@ class HumanAggregate:
     change: FileChange
 
 
+@dataclass
+class GraphEntry:
+    """One commit-level row in the right-hand graph sidebar."""
+
+    commit: str
+    timestamp: float
+    agent: str
+    prompt: str
+    files: list[str]
+    is_baseline: bool = False
+    reverts_commit: str = ""
+
+
 def _change_summary_markup(change: FileChange, cwd: str) -> str:
     """Builds a FileChange's Collapsible title: file path (relative to cwd, struck through +
     '(reverted)' if change.is_reverted) plus added/removed stats on the first line, then a note
@@ -729,6 +742,12 @@ class EditWatcherApp(App):
     consecutive Human or consecutive agent commits."""
 
     CSS = """
+    #body {
+        height: 1fr;
+    }
+    #feed {
+        width: 1fr;
+    }
     EditBlock {
         border: round $accent;
         margin: 0 1 1 1;
@@ -758,6 +777,22 @@ class EditWatcherApp(App):
         min-height: 1;
         border: none;
         padding: 0 1;
+    }
+    #graph-pane {
+        width: 38;
+        min-width: 28;
+        border-left: solid $panel;
+        padding: 0 1;
+        background: $surface;
+    }
+    #graph-title {
+        margin: 0 0 1 0;
+    }
+    #graph-scroll {
+        height: 1fr;
+    }
+    #graph {
+        height: auto;
     }
     """
     BINDINGS = [
@@ -836,13 +871,24 @@ class EditWatcherApp(App):
         self._splash_static: Static | None = (
             None  # set in _render_startup_splash; re-rendered by watch_theme on live theme switches
         )
+        self._graph_static: Static | None = None  # set in compose(); updated by _refresh_graph
+        self._live_graph_entries: list[GraphEntry] = []
+        self._live_graph_index: dict[str, GraphEntry] = {}
+        self._history_graph_entries: list[GraphEntry] = []
+        self._history_graph_index: dict[str, GraphEntry] = {}
         self.theme = "flexoki"  # default palette; must be set after _splash_static exists, since
         # assigning it fires watch_theme synchronously; user can still switch via the theme command palette
 
     def compose(self) -> ComposeResult:
         """Lays out the static header/footer chrome around a scrollable feed of blocks."""
         yield Header()
-        yield VerticalScroll(id="feed")
+        with Horizontal(id="body"):
+            yield VerticalScroll(id="feed")
+            with Vertical(id="graph-pane"):
+                yield Static("[bold]Graph[/bold]", id="graph-title", markup=True)
+                with VerticalScroll(id="graph-scroll"):
+                    self._graph_static = Static(id="graph", markup=True)
+                    yield self._graph_static
         yield Footer()
 
     def on_mount(self):
@@ -869,11 +915,16 @@ class EditWatcherApp(App):
         dirty on disk -- octo-generated revert commits (see ShadowGitWatcher.revert_file_to) are
         split out and rendered under their own rolling 'octo' group, everything else (unexplained
         human writes) renders as an ordinary Human flush."""
+        if self.file_watcher.refresh_human_commit_boundary():
+            self._break_human_streak()
         added_shell_activity = False  # tracks whether this cycle buffered anything, so pruning only runs when it can matter
         for tailer in self.tailers:
             result = tailer.poll().filter_since(
                 tailer.start_time
             )  # drop history a freshly started tailer shouldn't act on
+            if result.prompt_events:
+                self.file_watcher.break_human_edit_batch()
+                self._break_human_streak()
             for edit in result.edits:
                 if edit.content is None:
                     continue  # content not recoverable from the log; no fs fallback, so this edit is unreportable
@@ -905,6 +956,12 @@ class EditWatcherApp(App):
             else:
                 human_settled.append(settled)
         self._render_human_flush(human_settled)
+
+    def _break_human_streak(self):
+        """Forces the next unattributed human save to start a fresh visual block/group."""
+        self._current_human_block = None
+        self._human_group = None
+        self._human_aggregates = {}
 
     def _is_within_root(self, file_path: str) -> bool:
         """True if file_path lives inside self.root -- the shadow repo has no baseline outside
@@ -1067,6 +1124,13 @@ class EditWatcherApp(App):
             aggregate.widget = widget
             aggregate.change = change
         self._commit_widgets[settled.commit] = (widget, change)
+        self._upsert_graph_entry(
+            commit=settled.commit,
+            timestamp=settled.settled_at,
+            agent=edit.agent,
+            prompt=edit.prompt,
+            file_path=settled.file_path,
+        )
         self._scroll_feed_to_end()
         self._update_clear_cache_binding()
 
@@ -1103,6 +1167,14 @@ class EditWatcherApp(App):
             reverts_commit=reverted_sha[:8],
         )
         self._finish_render(group, settled.commit, change)
+        self._upsert_graph_entry(
+            commit=settled.commit,
+            timestamp=settled.settled_at,
+            agent=OCTO_AGENT_LABEL,
+            prompt=group.prompt,
+            file_path=settled.file_path,
+            reverts_commit=reverted_sha[:8],
+        )
         self._mark_reverted(reverted_sha)
 
     def _octo_group_for(
@@ -1285,6 +1357,20 @@ class EditWatcherApp(App):
             self._history_commit_shas.append(
                 entry.commit
             )  # track which commits were loaded for _commit_widgets cleanup
+            self._upsert_graph_entry(
+                commit=entry.commit,
+                timestamp=entry.timestamp,
+                agent=(
+                    INIT_AGENT_LABEL
+                    if entry.is_baseline
+                    else (entry.agent or HUMAN_AGENT_LABEL)
+                ),
+                prompt=entry.prompt,
+                file_path=entry.file_path,
+                is_baseline=entry.is_baseline,
+                reverts_commit=reverted_sha[:8] if reverted_sha else "",
+                history=True,
+            )
 
     @staticmethod
     def _history_entry_meta(entry: HistoryEntry):
@@ -1335,10 +1421,108 @@ class EditWatcherApp(App):
         _render_startup_splash has run) -- recolors the already-mounted splash to match."""
         if self._splash_static is not None:
             self._splash_static.update(self._splash_markup())
+        self._refresh_graph()
+
+    def _agent_color(self, agent: str) -> str:
+        """Resolves one agent label to the active theme color used across the TUI."""
+        role = AGENT_COLOR_ROLES.get(agent, DEFAULT_AGENT_COLOR_ROLE)
+        return getattr(self.current_theme, role)
+
+    def _truncate_graph_text(self, text: str, limit: int = 24) -> str:
+        """Keeps graph summaries narrow enough to stay readable in the sidebar."""
+        return text if len(text) <= limit else text[: limit - 3] + "..."
+
+    def _graph_summary(self, entry: GraphEntry) -> str:
+        """Builds the graph sidebar's terse per-commit summary line."""
+        if entry.reverts_commit:
+            return f"reverts {entry.reverts_commit[:8]}"
+        if entry.is_baseline:
+            if not entry.files:
+                return "startup baseline (no changes)"
+            head = os.path.relpath(entry.files[0], self.cwd)
+            if len(entry.files) == 1:
+                return f"baseline {head}"
+            return f"baseline {head} (+{len(entry.files) - 1})"
+        if entry.prompt:
+            return self._truncate_graph_text(entry.prompt)
+        if entry.files:
+            head = os.path.relpath(entry.files[0], self.cwd)
+            if len(entry.files) == 1:
+                return head
+            return f"{head} (+{len(entry.files) - 1})"
+        return "(no details)"
+
+    def _graph_markup(self) -> str:
+        """Renders the history + live commit timeline shown in the right-hand sidebar."""
+        entries = [*self._history_graph_entries, *self._live_graph_entries]
+        if not entries:
+            return "[dim]No commits rendered yet.[/dim]"
+        lines: list[str] = []
+        for index, entry in enumerate(entries):
+            color = self._agent_color(entry.agent)
+            when = time.strftime("%H:%M:%S", time.localtime(entry.timestamp))
+            summary = escape(self._graph_summary(entry))
+            lines.append(
+                f"[{color}]●[/] [dim]{entry.commit[:8]}[/dim] {when} "
+                f"{_agent_markup(entry.agent, self.current_theme)}"
+            )
+            lines.append(f"[{color}]│[/] {summary}")
+            if index != len(entries) - 1:
+                lines.append(f"[{color}]│[/]")
+        return "\n".join(lines)
+
+    def _refresh_graph(self):
+        """Re-renders the graph sidebar after any history/live commit change."""
+        if self._graph_static is not None:
+            self._graph_static.update(self._graph_markup())
+
+    def _drop_live_graph_entry(self, commit: str):
+        """Removes one superseded live graph node, e.g. after a human amend rewrites its SHA."""
+        entry = self._live_graph_index.pop(commit, None)
+        if entry is None:
+            return
+        self._live_graph_entries.remove(entry)
+        self._refresh_graph()
+
+    def _upsert_graph_entry(
+        self,
+        *,
+        commit: str,
+        timestamp: float,
+        agent: str,
+        prompt: str,
+        file_path: str | None,
+        is_baseline: bool = False,
+        reverts_commit: str = "",
+        history: bool = False,
+    ):
+        """Adds or updates one commit node in the graph, deduplicating multi-file commits."""
+        entries = self._history_graph_entries if history else self._live_graph_entries
+        index = self._history_graph_index if history else self._live_graph_index
+        entry = index.get(commit)
+        if entry is None:
+            entry = GraphEntry(
+                commit, timestamp, agent, prompt, [], is_baseline, reverts_commit
+            )
+            entries.append(entry)
+            index[commit] = entry
+        else:
+            entry.timestamp = timestamp
+            entry.agent = agent
+            entry.is_baseline = entry.is_baseline or is_baseline
+            if prompt:
+                entry.prompt = prompt
+            if reverts_commit:
+                entry.reverts_commit = reverts_commit
+        if file_path and file_path not in entry.files:
+            entry.files.append(file_path)
+        self._refresh_graph()
 
     def _render_init_baseline(self, baseline: list[SettledEdit]) -> EditBlock:
         """Renders the startup baseline commit as its own block: changes it picked up, or a 'no changes' notice."""
         note = INIT_NOTE_CHANGES if baseline else INIT_NOTE_NO_CHANGES
+        baseline_commit = baseline[0].commit if baseline else self._baseline_sha
+        baseline_time = baseline[0].settled_at if baseline else time.time()
         block = EditBlock()
         self.query_one("#feed", VerticalScroll).mount(
             block
@@ -1351,12 +1535,29 @@ class EditWatcherApp(App):
         self._current_agent_block = None  # baseline breaks any trailing agent streak
         self._current_octo_group = None  # ...and the trailing octo streak
         self._current_octo_key = None
+        if baseline_commit is not None:
+            self._upsert_graph_entry(
+                commit=baseline_commit,
+                timestamp=baseline_time,
+                agent=INIT_AGENT_LABEL,
+                prompt="",
+                file_path=None,
+                is_baseline=True,
+            )
         for settled in baseline:
             change = self._settled_to_filechange(
                 settled.file_path, settled.diff, settled.commit
             )
             widget = group.add_change(change)
             self._commit_widgets[settled.commit] = (widget, change)
+            self._upsert_graph_entry(
+                commit=settled.commit,
+                timestamp=settled.settled_at,
+                agent=INIT_AGENT_LABEL,
+                prompt="",
+                file_path=settled.file_path,
+                is_baseline=True,
+            )
         self._scroll_feed_to_end()
         return block  # return the block so callers can use it as an insertion anchor
 
@@ -1391,6 +1592,24 @@ class EditWatcherApp(App):
             note = _shell_activity_note(
                 self._matching_shell_activity(settled.settled_at)
             )
+            if settled.canceled:
+                if aggregate is None:
+                    continue
+                self._human_commits.pop(aggregate.latest_commit, None)
+                self._commit_widgets.pop(aggregate.latest_commit, None)
+                if settled.supersedes_commit:
+                    self._drop_live_graph_entry(settled.supersedes_commit)
+                group.remove_change(aggregate.widget)
+                self._human_aggregates.pop(settled.file_path, None)
+                if group.is_empty():
+                    block.remove_group(group)
+                    if block.is_empty():
+                        block.remove()
+                    if block is self._current_human_block:
+                        self._current_human_block = None
+                        self._human_group = None
+                        self._human_aggregates = {}
+                continue
             if aggregate is None:
                 added, removed = _diff_stats(settled.diff)
                 change = FileChange(
@@ -1403,6 +1622,8 @@ class EditWatcherApp(App):
             else:
                 self._human_commits.pop(aggregate.latest_commit, None)
                 self._commit_widgets.pop(aggregate.latest_commit, None)
+                if settled.supersedes_commit:
+                    self._drop_live_graph_entry(settled.supersedes_commit)
                 rel = str(Path(settled.file_path).relative_to(self.root))
                 diff = self.file_watcher.combined_diff(
                     rel, aggregate.first_commit, settled.commit
@@ -1418,6 +1639,13 @@ class EditWatcherApp(App):
                 aggregate.change = change
             self._human_commits[settled.commit] = (block, group, widget)
             self._commit_widgets[settled.commit] = (widget, change)
+            self._upsert_graph_entry(
+                commit=settled.commit,
+                timestamp=settled.settled_at,
+                agent=HUMAN_AGENT_LABEL,
+                prompt="",
+                file_path=settled.file_path,
+            )
         self._scroll_feed_to_end()
         self._update_clear_cache_binding()
 
@@ -1472,6 +1700,9 @@ class EditWatcherApp(App):
             self._commit_widgets.pop(sha, None)
         self._history_blocks.clear()
         self._history_commit_shas.clear()
+        self._history_graph_entries = []
+        self._history_graph_index = {}
+        self._refresh_graph()
         self._history_loaded = False
         self._update_history_binding()
 
@@ -1548,6 +1779,11 @@ class EditWatcherApp(App):
         self._history_blocks = set()
         self._history_commit_shas = []
         self._last_prompt_timestamp = {}
+        self._live_graph_entries = []
+        self._live_graph_index = {}
+        self._history_graph_entries = []
+        self._history_graph_index = {}
+        self._refresh_graph()
 
 
 def run(root: Path, cwd: str, agent: str):

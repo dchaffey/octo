@@ -55,6 +55,8 @@ class SettledEdit:
     diff: str            # diff between the previous and new committed content
     settled_at: float     # epoch seconds the commit was authored
     commit: str            # shadow-repo commit sha this edit landed in; pass to revert_commit() to undo it
+    supersedes_commit: str = ""  # prior sha this edit amended/replaced; empty for a brand-new commit
+    canceled: bool = False  # true when an open human commit collapsed back to no net change and was dropped
 
 
 @dataclass
@@ -125,7 +127,9 @@ class ShadowGitWatcher:
         self.last_commit_for_path: dict[str, str] = {}          # rel path -> most recent commit sha touching it; attribute()'s fast-path index
         self._pending_reverts: dict[str, str] = {}        # rel path -> commit sha that was reverted; cleared after commit_dirty
         self._dirty_path_state: dict[str, DirtyPathState] = {}  # rel path -> last observed dirty stat signature + timestamp
+        self._open_human_commits: dict[str, str] = {}     # rel path -> amendable human shadow commit still being upserted
         self.baseline_sha: str | None = None            # this session's startup baseline commit; history() uses this as an exclusive upper bound
+        self._last_project_head: str | None = self._project_head()  # last observed real-repo HEAD; a change closes human amend windows
 
     def commit_dirty(self) -> list[SettledEdit]:
         """Commits dirty paths after a short quiet period and returns them as SettledEdits.
@@ -137,6 +141,7 @@ class ShadowGitWatcher:
         can update immediately.
         """
         assert self._initialized, "initialize() must run before commit_dirty(), so a baseline exists to diff against"
+        self.refresh_human_commit_boundary()
         dirty = self._dirty_paths()
         now = time.time()
         for path in list(self._dirty_path_state):
@@ -206,6 +211,7 @@ class ShadowGitWatcher:
 
     def _settle_attribution(self, sha: str, rel: str, edit: ToolEdit) -> SettledEdit:
         """Attaches edit's agent/session/prompt to an already-matched commit and returns it as a SettledEdit."""
+        self.break_human_edit_batch()
         self._add_note(sha, edit)
         diff = self._git("show", "--format=", sha, "--", rel).stdout
         at = float(self._git("log", "-1", "--format=%at", sha).stdout.strip())
@@ -263,22 +269,51 @@ class ShadowGitWatcher:
         rel but its content already matches HEAD, or rel vanished between that dirty scan and this
         call (e.g. a transient temp file an editor's atomic save renamed away) -- nothing to record
         in either case."""
-        diff = self._git("diff", "--", rel).stdout  # diff vs the shadow repo's last commit, taken before staging it
+        open_commit = None if reverted_commit else self._open_human_commits.get(rel)
+        if open_commit and self._git("rev-parse", "--verify", "--quiet", open_commit, check=False).returncode != 0:
+            self._open_human_commits.pop(rel, None)
+            open_commit = None
+        diff_base = f"{open_commit}^" if open_commit else "HEAD"
+        diff = self._git("diff", diff_base, "--", rel).stdout  # when amending, show the net diff from the batch's original parent
         add_result = self._git("add", "--", rel, check=False)
         if add_result.returncode != 0:
             assert "did not match any files" in add_result.stderr, f"unexpected git add failure for {rel}: {add_result.stderr}"
             return None  # rel disappeared before we could stage it
-        result = self._git("commit", "-q", "-m", f"octo: edit {rel}", check=False)
+        commit_args = (
+            ("commit", "-q", "--amend", "--no-edit")
+            if open_commit is not None
+            else ("commit", "-q", "-m", f"octo: edit {rel}")
+        )
+        result = self._git(*commit_args, check=False)
         if result.returncode != 0:
-            assert "nothing to commit" in result.stdout, f"unexpected git commit failure for {rel}: {result.stdout}"
+            output = f"{result.stdout}\n{result.stderr}"
+            assert "nothing to commit" in output or "would make\nit empty" in output, (
+                f"unexpected git commit failure for {rel}: {output}"
+            )
+            if open_commit is not None:
+                self._git("reset", "-q", "--mixed", f"{open_commit}^")
+                self._open_human_commits.pop(rel, None)
+                self.last_commit_for_path[rel] = self._last_commit_touching(rel)
+                self._dirty_path_state.pop(rel, None)
+                return SettledEdit(
+                    str(self.root / rel),
+                    "",
+                    time.time(),
+                    "",
+                    supersedes_commit=open_commit,
+                    canceled=True,
+                )
             self._dirty_path_state.pop(rel, None)
             return None
         sha = self._git("rev-parse", "HEAD").stdout.strip()
         if reverted_commit:
             self._mark_as_revert(sha, reverted_commit)
+            self._open_human_commits.pop(rel, None)
+        else:
+            self._open_human_commits[rel] = sha
         self.last_commit_for_path[rel] = sha
         self._dirty_path_state.pop(rel, None)
-        return SettledEdit(str(self.root / rel), diff, time.time(), sha)
+        return SettledEdit(str(self.root / rel), diff, time.time(), sha, open_commit or "")
 
     def _git(self, *args: str, check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
         """Runs one git command against the shadow repo, with root as its work-tree. text=False
@@ -347,6 +382,8 @@ class ShadowGitWatcher:
         self._git("commit", "-q", "-m", "octo: baseline", "--allow-empty")
         sha = self._git("rev-parse", "HEAD").stdout.strip()  # single commit shared by every path the baseline picked up
         self.baseline_sha = sha  # mark the startup baseline, used by history() as an exclusive upper bound
+        self._open_human_commits = {}
+        self._last_project_head = self._project_head()
         for path in dirty:
             self.last_commit_for_path[path] = sha
         self._initialized = True
@@ -417,6 +454,7 @@ class ShadowGitWatcher:
         does nothing."""
         if self.is_commit_reverted(sha):
             return  # this commit already reverted, nothing to do
+        self.break_human_edit_batch()
         parent = f"{sha}^"
         assert self._git("rev-parse", "--verify", "--quiet", parent, check=False).returncode == 0, \
             f"commit {sha} has no parent -- there is no earlier state of {rel} to revert to"
@@ -492,6 +530,34 @@ class ShadowGitWatcher:
         except FileNotFoundError:
             return None
         return stat.st_mtime_ns, stat.st_size
+
+    def _last_commit_touching(self, rel: str) -> str:
+        """Returns the newest shadow-repo commit touching rel, or '' if none remains after a reset."""
+        result = self._git("log", "-1", "--format=%H", "--", rel, check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def break_human_edit_batch(self):
+        """Closes every open human amend-window so the next human save starts a fresh shadow commit."""
+        self._open_human_commits = {}
+
+    def _project_head(self) -> str | None:
+        """Returns the real repo HEAD commit for self.root, or None if this tree is not in a git repo."""
+        result = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def refresh_human_commit_boundary(self) -> bool:
+        """Closes human amend-windows after any real git commit in the watched tree."""
+        current = self._project_head()
+        if current != self._last_project_head:
+            self.break_human_edit_batch()
+            self._last_project_head = current
+            return True
+        return False
 
 
 def revert_commit(root: Path, shadow_dir_name: str, sha: str):
