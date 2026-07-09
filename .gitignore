@@ -1,0 +1,20 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+main
+
+# octo tool's own dogfooded repo state (not the real git history)
+.octo/
+
+# Claude Code local settings
+.claude/
+
+# Python prototype build/runtime artifacts
+pythonPrototype/venv/
+pythonPrototype/build/
+pythonPrototype/dist/
+pythonPrototype/__pycache__/
+
+# C++ test build artifacts
+test/build/
+test/octo_test

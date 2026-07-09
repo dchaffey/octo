@@ -1,0 +1,20 @@
+# .octoignore — patterns of files and directories to exclude from tracking
+# Syntax: gitignore-compatible patterns (*, ?, **, etc.)
+# Examples:
+#   node_modules/       — ignore all node_modules directories
+#   *.log               — ignore all .log files
+#   build/              — ignore the build directory
+#   .env                — ignore .env file
+#
+# The patterns below are already excluded unconditionally (see IGNORED_DIR_NAMES in
+# shadow_repo.py) -- they're listed here so they're visible/editable, not because removing
+# them stops the exclusion.
+.git/
+node_modules/
+__pycache__/
+.venv/
+venv/
+.claude/
+.cursor/
+.windsurf/
+.continue/
