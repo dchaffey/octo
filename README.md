@@ -1,6 +1,8 @@
 # octo
 A tool for tracking the work of your agents in your projects.
 
+![octo screenshot](docs/images/screenshot.svg)
+
 ## Status: prototype
 
 The current implementation is a prototype and lives entirely in [`pythonPrototype/`](pythonPrototype/).
