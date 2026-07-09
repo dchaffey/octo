@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Git-backed replacement for FileSnapshotWatcher: uses a shadow git repo (.octo) whose
-work-tree is the watched directory, so every edit becomes a real commit -- giving free
+work-tree is the watched directory, so settled edits become real commits -- giving free
 diffing, history, and revert (git revert writes straight back into the real files).
 
-Commit-on-write, attribute-after-the-fact: every settled disk write is committed immediately
-via commit_dirty(), attributed to "Human" by default regardless of who actually wrote it --
-this is always correct because it's built directly from bytes observed on disk, never replayed
-from a log. When an agent transcript entry later explains a commit already made, attribute()
-attaches a git-notes entry naming the agent/session/prompt to that commit -- no commit message
-rewriting, no SHA changes, no stale commit references elsewhere. This avoids the crash class a
-prior design had: there is no "does the log's fragment match some assumed prior state" check,
-because nothing is ever reconstructed and trusted -- every commit is exactly what was on disk at
-that moment, and attribute() only ever *tests* candidate matches (via EditContent.apply()'s
-non-asserting probe), never commits based on one it assumes to be true."""
+Debounced commit-on-write, attribute-after-the-fact: settled disk writes are committed via
+commit_dirty(), attributed to "Human" by default regardless of who actually wrote them. This is
+always correct because it's built directly from bytes observed on disk, never replayed from a log.
+When an agent transcript entry later explains a commit already made, attribute() attaches a
+git-notes entry naming the agent/session/prompt to that commit -- no commit message rewriting, no
+SHA changes, no stale commit references elsewhere. This avoids the crash class a prior design had:
+there is no "does the log's fragment match some assumed prior state" check, because nothing is
+ever reconstructed and trusted -- every commit is exactly what was on disk at that moment, and
+attribute() only ever *tests* candidate matches (via EditContent.apply()'s non-asserting probe),
+never commits based on one it assumes to be true."""
 
 import subprocess
 import time
@@ -45,6 +45,7 @@ SESSION_TRAILER = "Session: "             # note/legacy-message line carrying th
 REVERTED_BY_TRAILER = "Reverted by: "     # note line marking a commit as having been reverted
 REVERTS_TRAILER = "Reverts: "             # note line marking a commit as a revert of another
 WALK_BACK_LIMIT = 5  # how many recent commits touching a path attribute() searches before giving up
+DIRTY_DEBOUNCE_SECONDS = 5.0  # quiet period before unattributed dirty files are committed
 
 
 @dataclass
@@ -79,6 +80,13 @@ class HistoryEntry:
     is_baseline: bool                   # true if this entry came from an initialize() baseline commit, not a write-watcher commit
 
 
+@dataclass
+class DirtyPathState:
+    """Last observed on-disk state for one dirty path, used to debounce manual/autosave writes."""
+    signature: tuple[int, int] | None
+    changed_at: float
+
+
 def _note_text(edit: ToolEdit) -> str:
     """Builds attribute()'s git-notes body: Agent/Session trailers plus the prompt, parsed back by _parse_attribution()."""
     return f"{AGENT_TRAILER}{edit.agent}\n{SESSION_TRAILER}{edit.session_id}\n\n{edit.prompt}"
@@ -106,7 +114,7 @@ def _parse_attribution(text: str) -> tuple[str, str, str]:
 
 
 class ShadowGitWatcher:
-    """Tracks a directory tree via a shadow git repo, committing every write immediately and
+    """Tracks a directory tree via a shadow git repo, committing settled writes and
     reattributing commits to agents after the fact via git notes."""
 
     def __init__(self, root: Path, shadow_dir_name: str = SHADOW_DIR_NAME):
@@ -116,18 +124,29 @@ class ShadowGitWatcher:
         self._initialized = False                           # true once initialize() has committed the startup baseline
         self.last_commit_for_path: dict[str, str] = {}          # rel path -> most recent commit sha touching it; attribute()'s fast-path index
         self._pending_reverts: dict[str, str] = {}        # rel path -> commit sha that was reverted; cleared after commit_dirty
+        self._dirty_path_state: dict[str, DirtyPathState] = {}  # rel path -> last observed dirty stat signature + timestamp
         self.baseline_sha: str | None = None            # this session's startup baseline commit; history() uses this as an exclusive upper bound
 
     def commit_dirty(self) -> list[SettledEdit]:
-        """Commits every currently-dirty path immediately (no settle wait) and returns them as SettledEdits.
+        """Commits dirty paths after a short quiet period and returns them as SettledEdits.
 
         Callers run this after draining agent transcripts each poll tick, so any write an agent's
         transcript already explained this tick has already been committed and annotated by
         attribute() (and is thus no longer dirty) -- everything left here is a genuine unattributed
-        (human, or not-yet-explained) write.
+        (human, or not-yet-explained) write. Pending reverts bypass the debounce so the revert UI
+        can update immediately.
         """
         assert self._initialized, "initialize() must run before commit_dirty(), so a baseline exists to diff against"
-        settled = [self._commit_path(path, self._pending_reverts.get(path)) for path in sorted(self._dirty_paths())]
+        dirty = self._dirty_paths()
+        now = time.time()
+        for path in list(self._dirty_path_state):
+            if path not in dirty:
+                self._dirty_path_state.pop(path, None)
+        settled = [
+            self._commit_path(path, self._pending_reverts.get(path))
+            for path in sorted(dirty)
+            if self._pending_reverts.get(path) or self._is_debounced_dirty(path, now)
+        ]
         self._pending_reverts.clear()
         return [s for s in settled if s is not None]  # drop no-op commits (see _commit_path)
 
@@ -252,11 +271,13 @@ class ShadowGitWatcher:
         result = self._git("commit", "-q", "-m", f"octo: edit {rel}", check=False)
         if result.returncode != 0:
             assert "nothing to commit" in result.stdout, f"unexpected git commit failure for {rel}: {result.stdout}"
+            self._dirty_path_state.pop(rel, None)
             return None
         sha = self._git("rev-parse", "HEAD").stdout.strip()
         if reverted_commit:
             self._mark_as_revert(sha, reverted_commit)
         self.last_commit_for_path[rel] = sha
+        self._dirty_path_state.pop(rel, None)
         return SettledEdit(str(self.root / rel), diff, time.time(), sha)
 
     def _git(self, *args: str, check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
@@ -450,6 +471,23 @@ class ShadowGitWatcher:
         """Returns paths (relative to root) that differ from the shadow repo's last commit."""
         status = self._git("status", "--porcelain")
         return {line[3:] for line in status.stdout.splitlines()}
+
+    def _is_debounced_dirty(self, rel: str, now: float) -> bool:
+        """True once rel has stayed dirty with the same on-disk stat signature for the debounce window."""
+        signature = self._dirty_signature(rel)
+        state = self._dirty_path_state.get(rel)
+        if state is None or state.signature != signature:
+            self._dirty_path_state[rel] = DirtyPathState(signature, now)
+            return False
+        return now - state.changed_at >= DIRTY_DEBOUNCE_SECONDS
+
+    def _dirty_signature(self, rel: str) -> tuple[int, int] | None:
+        """Returns a cheap change signature for rel, or None when the dirty path is deleted."""
+        try:
+            stat = (self.root / rel).lstat()
+        except FileNotFoundError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
 
 
 def revert_commit(root: Path, shadow_dir_name: str, sha: str):
