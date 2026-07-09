@@ -13,6 +13,33 @@ so you get diffing, history, and revert for free.
 The end goal is to rewrite this in a systems language (Zig, C, or C++) for a faster, dependency-free
 binary; the Python version exists to validate the design first.
 
+### How it works
+
+octo watches two things at once and joins them together: your project's files, and the session
+transcripts each agent CLI already keeps on disk. Every write to disk is committed immediately
+under a "Human" author — octo never delays a commit waiting to find out who made it. Once an
+agent's own transcript later logs that exact content, the commit is relabeled to that agent via
+a git-notes annotation. Git itself is the storage and history engine throughout: no separate
+database, diff engine, or undo log — `.octo` is just a real (shadow) git repository, so diffing,
+history, and revert all fall out of plain git for free.
+
+```mermaid
+flowchart LR
+    subgraph Inputs
+        FS["Watched directory<br/>(your project files)"]
+        SESS["Agent session transcripts<br/>~/.claude/projects, ~/.codex/sessions,<br/>~/.gemini/antigravity-cli"]
+    end
+
+    FS -- "file changed" --> COMMIT["Commit as 'Human'<br/>(immediately, no waiting)"]
+    COMMIT --> SHADOW[(".octo shadow git repo")]
+    SESS -- "transcript later confirms<br/>which agent wrote it" --> ATTR["Relabel commit to agent<br/>(git-notes annotation)"]
+    ATTR --> SHADOW
+    SHADOW --> TUI["Textual UI<br/>diff / history / revert"]
+```
+
+Because everything lands in a real git repo, revert is just `git revert`/checkout against `.octo`,
+and history is just `git log` — octo's own code only has to watch, correlate, and render.
+
 ### Entry point
 
 [`pythonPrototype/octo.py`](pythonPrototype/octo.py) is the entry point:
