@@ -4,8 +4,8 @@
 # terminal and watch how each edit gets attributed and committed to the shadow repo.
 #
 # Usage: ./scratch_test.sh [dir] [octo.py args...]
-#   ./scratch_test.sh                       # watch ../test, all agents
-#   ./scratch_test.sh ../test --agent codex # watch ../test, Codex only
+#   ./scratch_test.sh                  # watch ../test
+#   ./scratch_test.sh ../test --cwd ~/other-project # watch ../test, correlate against another project's sessions
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # this script's own directory, to locate octo.py
@@ -28,4 +28,4 @@ echo "Scratch dir ready: $TEST_DIR"
 echo "Point an agent CLI's cwd at this directory in another terminal, then edit main.txt through it."
 echo
 
-exec python3 -u "$SCRIPT_DIR/octo.py" "$TEST_DIR" --diffs "$@"
+exec python3 -u "$SCRIPT_DIR/octo.py" "$TEST_DIR" "$@"
