@@ -45,7 +45,7 @@ SESSION_TRAILER = "Session: "             # note/legacy-message line carrying th
 REVERTED_BY_TRAILER = "Reverted by: "     # note line marking a commit as having been reverted
 REVERTS_TRAILER = "Reverts: "             # note line marking a commit as a revert of another
 WALK_BACK_LIMIT = 5  # how many recent commits touching a path attribute() searches before giving up
-DIRTY_DEBOUNCE_SECONDS = 5.0  # quiet period before unattributed dirty files are committed
+DIRTY_DEBOUNCE_SECONDS = 2.0  # quiet period before unattributed dirty files are committed
 
 
 @dataclass
@@ -434,6 +434,10 @@ class ShadowGitWatcher:
         tracking binaries is a supported use case, not just text source files."""
         result = self._git("show", f"{ref}:{rel}", check=False, text=False)
         return result.stdout if result.returncode == 0 else b""
+
+    def combined_diff(self, rel: str, first_commit: str, last_commit: str) -> str:
+        """Returns rel's net diff from just before first_commit through last_commit."""
+        return self._git("diff", f"{first_commit}^", last_commit, "--", rel).stdout
 
     def is_commit_reverted(self, sha: str) -> bool:
         """True if this commit is currently reverted (has a revert that itself hasn't been reverted)."""

@@ -474,6 +474,16 @@ class FileChange:
     reverts_commit: str = ""  # if this commit is a revert, the SHA of what it reverted (truncated for display)
 
 
+@dataclass
+class HumanAggregate:
+    """One current Human-row aggregate for repeated edits to the same file."""
+
+    first_commit: str
+    latest_commit: str
+    widget: Collapsible
+    change: FileChange
+
+
 def _change_summary_markup(change: FileChange, cwd: str) -> str:
     """Builds a FileChange's Collapsible title: file path (relative to cwd, struck through +
     '(reverted)' if change.is_reverted) plus added/removed stats on the first line, then a note
@@ -781,13 +791,19 @@ class EditWatcherApp(App):
         ] = {}  # (session_id, prompt) -> header group new matching edits append into
         self._human_commits: dict[
             str, tuple[EditBlock, PromptGroup, Collapsible]
-        ] = {}  # commit sha -> (block, group, widget) for a still-Human commit, so a later attribute() can move it in place
+        ] = {}  # latest displayed Human commit sha -> (block, group, widget), so a later attribute() can move it in place
         self._current_human_block: EditBlock | None = (
             None  # trailing Human block that new human flushes merge into, until an agent/init event breaks the streak
         )
         self._human_group: PromptGroup | None = (
             None  # the single PromptGroup inside _current_human_block, if any
         )
+        self._human_aggregates: dict[
+            str, HumanAggregate
+        ] = {}  # absolute file path -> current aggregate row inside the trailing Human group
+        self._agent_aggregates: dict[
+            tuple[tuple[str, str], str], HumanAggregate
+        ] = {}  # ((session_id, prompt), absolute file path) -> current aggregate row for that agent group
         self._current_agent_block: EditBlock | None = (
             None  # trailing agent block that new agent prompts merge into, until a human/init event breaks the streak
         )
@@ -903,6 +919,7 @@ class EditWatcherApp(App):
         diff/revert affordance backs it, just a record that it happened instead of a crash."""
         self._current_human_block = None  # an agent action breaks the trailing Human streak, same as _render_agent_edit
         self._human_group = None
+        self._human_aggregates = {}
         self._current_octo_group = None  # ...and the trailing octo streak
         self._current_octo_key = None
         key = (
@@ -1013,6 +1030,7 @@ class EditWatcherApp(App):
             None  # any agent edit breaks the trailing Human streak
         )
         self._human_group = None
+        self._human_aggregates = {}
         self._current_octo_group = None  # ...and the trailing octo streak
         self._current_octo_key = None
         key = (
@@ -1024,10 +1042,33 @@ class EditWatcherApp(App):
             group = self._open_agent_group(
                 settled.settled_at, edit.agent, edit.prompt, key
             )
-        change = self._settled_to_filechange(
-            settled.file_path, settled.diff, settled.commit
-        )
-        self._finish_render(group, settled.commit, change)
+        aggregate_key = (key, settled.file_path)
+        aggregate = self._agent_aggregates.get(aggregate_key)
+        if aggregate is None:
+            change = self._settled_to_filechange(
+                settled.file_path, settled.diff, settled.commit
+            )
+            widget = group.add_change(change)
+            self._agent_aggregates[aggregate_key] = HumanAggregate(
+                settled.commit, settled.commit, widget, change
+            )
+        else:
+            self._commit_widgets.pop(aggregate.latest_commit, None)
+            rel = str(Path(settled.file_path).relative_to(self.root))
+            diff = self.file_watcher.combined_diff(
+                rel, aggregate.first_commit, settled.commit
+            )
+            change = self._settled_to_filechange(
+                settled.file_path, diff, settled.commit
+            )
+            group.remove_change(aggregate.widget)
+            widget = group.add_change(change)
+            aggregate.latest_commit = settled.commit
+            aggregate.widget = widget
+            aggregate.change = change
+        self._commit_widgets[settled.commit] = (widget, change)
+        self._scroll_feed_to_end()
+        self._update_clear_cache_binding()
 
     def _render_octo_revert(self, settled: SettledEdit, reverted_sha: str):
         """Renders one octo-generated revert commit (see ShadowGitWatcher.revert_file_to /
@@ -1045,6 +1086,7 @@ class EditWatcherApp(App):
         )
         self._current_agent_block = None  # ...and the trailing agent streak
         self._human_group = None
+        self._human_aggregates = {}
         group, self._current_octo_group, self._current_octo_key = self._octo_group_for(
             reverted_sha,
             settled.settled_at,
@@ -1179,6 +1221,7 @@ class EditWatcherApp(App):
         if block is self._current_human_block:
             self._current_human_block = None  # trailing block just emptied out; next flush must start a fresh one
             self._human_group = None
+            self._human_aggregates = {}
 
     def _render_history(self, entries: list[HistoryEntry]):
         """Reconstructs past-session blocks from the shadow repo's existing commit log, oldest first.
@@ -1304,6 +1347,7 @@ class EditWatcherApp(App):
         block.add_group(group)
         self._current_human_block = None  # baseline breaks any trailing Human streak
         self._human_group = None
+        self._human_aggregates = {}
         self._current_agent_block = None  # baseline breaks any trailing agent streak
         self._current_octo_group = None  # ...and the trailing octo streak
         self._current_octo_key = None
@@ -1321,7 +1365,8 @@ class EditWatcherApp(App):
         filtered out by poll_once and rendered via _render_octo_revert instead), merging into the
         trailing Human block's single header group if that streak hasn't been broken by an
         agent/init event since, so consecutive human flushes render as one growing block instead of
-        one block apiece."""
+        one block apiece; repeated edits to the same file inside that still-open Human block
+        collapse into one row showing the net diff from the first such commit through the latest."""
         if not flushed:
             return  # nothing was dirty on disk this poll tick
         self._current_agent_block = (
@@ -1340,15 +1385,37 @@ class EditWatcherApp(App):
             block.add_group(group)
             self._current_human_block = block
             self._human_group = group
+            self._human_aggregates = {}
         for settled in flushed:
-            added, removed = _diff_stats(settled.diff)
+            aggregate = self._human_aggregates.get(settled.file_path)
             note = _shell_activity_note(
                 self._matching_shell_activity(settled.settled_at)
             )
-            change = FileChange(
-                settled.file_path, added, removed, settled.commit, settled.diff, note
-            )
-            widget = group.add_change(change)
+            if aggregate is None:
+                added, removed = _diff_stats(settled.diff)
+                change = FileChange(
+                    settled.file_path, added, removed, settled.commit, settled.diff, note
+                )
+                widget = group.add_change(change)
+                self._human_aggregates[settled.file_path] = HumanAggregate(
+                    settled.commit, settled.commit, widget, change
+                )
+            else:
+                self._human_commits.pop(aggregate.latest_commit, None)
+                self._commit_widgets.pop(aggregate.latest_commit, None)
+                rel = str(Path(settled.file_path).relative_to(self.root))
+                diff = self.file_watcher.combined_diff(
+                    rel, aggregate.first_commit, settled.commit
+                )
+                added, removed = _diff_stats(diff)
+                change = FileChange(
+                    settled.file_path, added, removed, settled.commit, diff, note
+                )
+                group.remove_change(aggregate.widget)
+                widget = group.add_change(change)
+                aggregate.latest_commit = settled.commit
+                aggregate.widget = widget
+                aggregate.change = change
             self._human_commits[settled.commit] = (block, group, widget)
             self._commit_widgets[settled.commit] = (widget, change)
         self._scroll_feed_to_end()
@@ -1471,6 +1538,8 @@ class EditWatcherApp(App):
         self._human_commits = {}
         self._current_human_block = None
         self._human_group = None
+        self._human_aggregates = {}
+        self._agent_aggregates = {}
         self._current_agent_block = None
         self._shell_activity = []
         self._history_anchor = None
