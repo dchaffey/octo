@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['edit_watcher.py'],
+    ['octo.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='edit_watcher',
+    name='octo',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

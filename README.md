@@ -15,10 +15,10 @@ binary; the Python version exists to validate the design first.
 
 ### Entry point
 
-[`pythonPrototype/edit_watcher.py`](pythonPrototype/edit_watcher.py) is the entry point:
+[`pythonPrototype/octo.py`](pythonPrototype/octo.py) is the entry point:
 
 ```
-python3 pythonPrototype/edit_watcher.py [root] [--cwd CWD]
+python3 pythonPrototype/octo.py [root] [--cwd CWD]
 ```
 
 - `root` — directory to watch for edits (defaults to the current directory)
@@ -26,13 +26,13 @@ python3 pythonPrototype/edit_watcher.py [root] [--cwd CWD]
 
 ### Building a standalone binary
 
-The prototype ships a PyInstaller spec (`pythonPrototype/edit_watcher.spec`) that bundles
-`edit_watcher.py` into a single executable:
+The prototype ships a PyInstaller spec (`pythonPrototype/octo.spec`) that bundles
+`octo.py` into a single executable:
 
 ```
 cd pythonPrototype
 pip install textual pygments pyinstaller
-pyinstaller edit_watcher.spec
+pyinstaller octo.spec
 ```
 
-The resulting binary is written to `pythonPrototype/dist/edit_watcher`.
+The resulting binary is written to `pythonPrototype/dist/octo`.

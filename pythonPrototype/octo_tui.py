@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Textual rendering of edit_watcher's attributed edits: one bordered EditBlock per streak of
+"""Textual rendering of octo's attributed edits: one bordered EditBlock per streak of
 consecutive same-category commits (a run of consecutive Human flushes, or a run of consecutive
 agent edits regardless of which agent/session/prompt), each block containing one header line per
 prompt (or human-edit flush) seen in that streak, with every file it touched listed underneath
@@ -715,7 +715,7 @@ class EditBlock(Vertical):
 
 
 class EditWatcherApp(App):
-    """Live Textual view of edit_watcher's attributed edits, one bordered block per streak of
+    """Live Textual view of octo's attributed edits, one bordered block per streak of
     consecutive Human or consecutive agent commits."""
 
     CSS = """
@@ -1482,5 +1482,5 @@ class EditWatcherApp(App):
 
 
 def run(root: Path, cwd: str, agent: str):
-    """Entry point used by edit_watcher.py's --tui flag to launch the Textual app."""
+    """Entry point used by octo.py's --tui flag to launch the Textual app."""
     EditWatcherApp(root, cwd, agent).run()

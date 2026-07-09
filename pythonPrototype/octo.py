@@ -11,7 +11,7 @@ is attempted here -- this only observes and reports."""
 import argparse
 from pathlib import Path
 
-from edit_watcher_tui import run as run_tui
+from octo_tui import run as run_tui
 
 AGENT_FILTER = "both"  # always correlate against every supported agent (Claude, Antigravity, Codex)
 

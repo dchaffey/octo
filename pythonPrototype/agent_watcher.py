@@ -82,7 +82,7 @@ class ShellMoveEdit:
 @dataclass
 class ShellActivity:
     """One shell command an agent ran that couldn't be safely parsed into a verified file edit.
-    Purely a live-session UI hint (see edit_watcher_tui.py) that some agent activity coincided
+    Purely a live-session UI hint (see octo_tui.py) that some agent activity coincided
     with an otherwise-unexplained commit -- never persisted as attribution, never revertable."""
     timestamp: float        # epoch seconds the command was issued
     end_timestamp: float      # epoch seconds the command's result was logged
@@ -254,7 +254,7 @@ def _parse_timestamp(iso_timestamp: str) -> float:
 
 def _cwd_related(session_cwd: str, watched_cwd: str) -> bool:
     """True if session_cwd and watched_cwd sit on the same directory chain -- equal, or one nested
-    inside the other -- so a session started in a subdirectory of the watched root (edit_watcher's
+    inside the other -- so a session started in a subdirectory of the watched root (octo's
     root recursively covers its whole subtree) or in an ancestor of it still correlates correctly,
     unlike a bare exact-string cwd match."""
     a, b = Path(session_cwd), Path(watched_cwd)
