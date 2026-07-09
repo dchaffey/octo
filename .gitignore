@@ -5,6 +5,7 @@ main
 
 # octo tool's own dogfooded repo state (not the real git history)
 .octo/
+.octoignore.swp
 
 # Claude Code local settings
 .claude/
