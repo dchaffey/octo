@@ -95,10 +95,10 @@ class ShellActivity:
 @dataclass
 class PromptEvent:
     """One newly observed human-typed prompt, used to close human autosave batches."""
-    timestamp: float
-    session_id: str
-    prompt: str
-    agent: str
+    timestamp: float  # epoch seconds the prompt boundary was observed
+    session_id: str     # transcript/conversation UUID the prompt belongs to
+    prompt: str           # human-typed prompt text
+    agent: str              # human-readable name of the agent whose session saw it
 
 
 @dataclass

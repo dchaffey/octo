@@ -117,7 +117,10 @@ def _parse_attribution(text: str) -> tuple[str, str, str]:
 
 class ShadowGitWatcher:
     """Tracks a directory tree via a shadow git repo, committing settled writes and
-    reattributing commits to agents after the fact via git notes."""
+    reattributing commits to agents after the fact via git notes. Human writes stay
+    amendable until an agent attribution, an octo revert, a new prompt boundary, or a
+    real-project HEAD change closes the batch, so editor autosaves collapse into one
+    net shadow commit instead of a row per save."""
 
     def __init__(self, root: Path, shadow_dir_name: str = SHADOW_DIR_NAME):
         assert root.is_dir(), "watched root must exist"

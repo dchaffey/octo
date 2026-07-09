@@ -488,13 +488,13 @@ class HumanAggregate:
 class GraphEntry:
     """One commit-level row in the right-hand graph sidebar."""
 
-    commit: str
-    timestamp: float
-    agent: str
-    prompt: str
-    files: list[str]
-    is_baseline: bool = False
-    reverts_commit: str = ""
+    commit: str  # shadow-repo commit sha represented by this graph node
+    timestamp: float  # epoch seconds shown beside the node
+    agent: str  # display label/color source for the node
+    prompt: str  # prompt excerpt shown when this commit came from an agent turn
+    files: list[str]  # absolute paths touched by this commit, deduped across multi-file renders
+    is_baseline: bool = False  # true for the startup baseline node
+    reverts_commit: str = ""  # original commit sha if this node is an octo revert
 
 
 def _change_summary_markup(change: FileChange, cwd: str) -> str:
