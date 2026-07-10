@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Hook octo installs into each agent's config (see hook_installer.py). PreToolUse/BeforeTool
 carries no real gating logic yet -- always approves, so it can never block a genuine write.
-Stop is the turn-boundary signal worktree_sync.py's sync sequence hooks into: it notifies the
-octo process that owns the worktree this session ran in (see worktree_manager.read_owner_marker),
+Stop is the turn-boundary signal the sync sequence hooks into: it notifies the octo process
+watching this project (worktree-lane via read_owner_marker, root-lane via find_matching_session),
 then always exits 0 too -- it is a pure observer, never blocking/re-prompting the agent (that's
 the doc's separately-scoped, not-yet-implemented conflict-delegation path)."""
 
@@ -10,8 +10,10 @@ import json
 import sys
 from pathlib import Path
 
-from session_registry import notify_turn_ended
+from session_registry import find_matching_session, notify_turn_ended
 from worktree_manager import read_owner_marker
+
+DEFAULT_AGENT = "Claude"  # only agent with confirmed Stop hooks today; Codex/Antigravity Stop events are unverified
 
 
 def main():
@@ -24,16 +26,25 @@ def main():
 
 
 def _signal_turn_end(payload: dict):
-    """Resolves which live octo process owns the worktree this Stop event fired in (via its
-    cwd, the only thing this hook subprocess knows about its own context) and notifies it, so
-    that process's next poll tick runs the turn-boundary sync sequence for this worktree.
-    No-op if cwd carries no owner marker -- e.g. the hook fired in a plain Claude session that
-    isn't one of octo's managed worktrees at all."""
+    """Resolves which live octo process to notify: worktree-lane via the clone's owner marker,
+    root-lane via find_matching_session (agent running directly in the watched project).
+    No-op if neither path resolves -- the hook fired in a session octo isn't tracking."""
     cwd = Path(payload["cwd"])
+    session_id = payload.get("session_id", "")
+    transcript_path = payload.get("transcript_path", "")
+    agent_name = DEFAULT_AGENT
+
+    # Path 1: worktree lane (existing) -- clone carries an owner marker
     owner = read_owner_marker(cwd)
-    if owner is None:
+    if owner is not None:
+        notify_turn_ended(owner["pid"], cwd, session_id, transcript_path, agent_name)
         return
-    notify_turn_ended(owner["pid"], cwd, payload.get("session_id", ""), payload.get("transcript_path", ""))
+
+    # Path 2: root lane -- agent running directly in the watched project
+    session = find_matching_session(cwd)
+    if session is not None:
+        # worktree_path = Path("") signals "this is root-lane, not a worktree"
+        notify_turn_ended(session.pid, Path(""), session_id, transcript_path, agent_name)
 
 
 if __name__ == "__main__":

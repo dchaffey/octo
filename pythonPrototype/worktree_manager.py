@@ -42,6 +42,17 @@ class WorktreeHandle:
     branch: str       # branch name checked out there, unique to this invocation
 
 
+def repo_root(cwd: Path) -> Path:
+    """Resolves the git repository root containing cwd, via `git rev-parse --show-toplevel`.
+    Public: also used by worktree_sync.py to locate the real repo a worktree was cloned from,
+    once a WorktreeRegistration confirms cwd's tree is inside one."""
+    result = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, check=True,
+    )
+    return Path(result.stdout.strip())
+
+
 def _repo_slug(repo_root: Path) -> str:
     """Short, filesystem-safe identifier for repo_root, unique enough that two different repos
     sharing a directory name (e.g. two checkouts both named 'app') don't collide under

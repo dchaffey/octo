@@ -119,25 +119,28 @@ def drain_pending_worktrees(pid: int) -> list[WorktreeRegistration]:
 
 @dataclass
 class TurnEnded:
-    """One agent worktree's turn-boundary signal, from octo_hook.py's Stop handler, not yet drained
-    by the octo process watching that worktree."""
-    worktree_path: Path    # clone path the Stop hook fired in
+    """One agent's turn-boundary signal, from octo_hook.py's Stop handler, not yet drained
+    by the octo process watching it.  worktree_path is the clone path for worktree-lane
+    notifications, or Path("") for root-lane (agent running directly in the project)."""
+    worktree_path: Path    # clone path (Path("") for root-lane)
     session_id: str          # Claude session id the Stop event belongs to
     transcript_path: str       # transcript file for that session, for a one-shot prompt-text read
+    agent_name: str             # which agent fired the hook (e.g. "Claude")
     notified_at: float           # epoch seconds the notification was written
 
 
-def notify_turn_ended(owner_pid: int, worktree_path: Path, session_id: str, transcript_path: str) -> Path:
+def notify_turn_ended(owner_pid: int, worktree_path: Path, session_id: str, transcript_path: str,
+                       agent_name: str) -> Path:
     """Drops one TurnEnded for owner_pid's octo process to pick up on its next poll tick (see
     drain_pending_turn_ends) -- called by octo_hook.py's Stop handler right after it resolves
-    worktree_path's owner marker (see worktree_manager.read_owner_marker). Returns the file path
-    written."""
+    worktree_path's owner marker (see worktree_manager.read_owner_marker), or via the root-lane
+    fallback (see find_matching_session). Returns the file path written."""
     pending_dir = PENDING_TURN_ENDS_DIR / str(owner_pid)  # this octo process's own inbox, so concurrent Stop hooks targeting different octo processes never collide
     pending_dir.mkdir(parents=True, exist_ok=True)
     entry_path = pending_dir / f"{uuid.uuid4().hex}.json"  # unique per notification, so concurrent Stop hooks never clobber each other's entry
     entry_path.write_text(json.dumps({
         "worktree_path": str(worktree_path), "session_id": session_id,
-        "transcript_path": transcript_path, "notified_at": time.time(),
+        "transcript_path": transcript_path, "agent_name": agent_name, "notified_at": time.time(),
     }), encoding="utf-8")
     return entry_path
 
@@ -154,6 +157,7 @@ def drain_pending_turn_ends(pid: int) -> list[TurnEnded]:
         entry = json.loads(entry_path.read_text(encoding="utf-8"))
         entry_path.unlink()
         turn_ends.append(TurnEnded(
-            Path(entry["worktree_path"]), entry["session_id"], entry["transcript_path"], entry["notified_at"],
+            Path(entry["worktree_path"]), entry["session_id"], entry["transcript_path"],
+            entry.get("agent_name", ""), entry["notified_at"],
         ))
     return turn_ends
