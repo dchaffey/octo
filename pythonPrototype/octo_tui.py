@@ -37,7 +37,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import (
     Button,
@@ -50,8 +50,13 @@ from textual.widgets import (
     Tree,
 )
 
-from agent_watcher import ShellActivity, ShellMoveEdit, ToolEdit, build_tailers
+from agent_detection import AGENT_BINARIES
+from agent_watcher import ShellActivity, ShellMoveEdit, ToolEdit, build_tailers, read_last_prompt
+from root_lane import RootLane
+from session_registry import TurnEnded, WorktreeRegistration, drain_pending_turn_ends, drain_pending_worktrees
 from shadow_repo import AffectedCommit, HistoryEntry, OCTOIGNORE_FILENAME, SettledEdit, ShadowGitWatcher
+from worktree_manager import WorktreeInfo, list_agent_worktrees, repo_root as resolve_repo_root
+from worktree_sync import down_sync, up_sync
 
 POLL_INTERVAL_SECONDS = 0.5  # how often the app re-scans watched files and transcripts
 HUMAN_AGENT_LABEL = (
@@ -90,6 +95,12 @@ IGNORE_EDITOR_KEY = "i"  # footer keybinding that opens the ignore pattern edito
 IGNORE_EDITOR_ACTION = (
     "open_ignore_editor"  # action name the IGNORE_EDITOR_KEY binding dispatches to
 )
+BRANCHES_KEY = "a"  # footer keybinding that opens the running-agent-branches overview screen
+BRANCHES_ACTION = "show_branches"  # action name the BRANCHES_KEY binding dispatches to
+BRANCHES_REFRESH_SECONDS = 1.0  # how often BranchesScreen re-queries `git worktree list` while open
+RETRY_SYNC_KEY = "r"  # BranchesScreen keybinding that re-dispatches sync for every paused worktree
+RETRY_SYNC_ACTION = "retry_paused"  # action name the RETRY_SYNC_KEY binding dispatches to
+_AGENT_DISPLAY_NAMES = {binary: agent for agent, binary in AGENT_BINARIES.items()}  # CLI binary name -> display name, inverse of AGENT_BINARIES, for labeling a worktree's branch by its creating agent
 DIFF_ADDED_BG = (
     "on #123a12"  # subtle green background tint applied to a diff's added lines
 )
@@ -220,6 +231,15 @@ def _diff_markup(diff: str, file_path: str, theme: Theme) -> str:
             )
             lines.append(f"        {code}")
     return "\n".join(lines)
+
+
+def _branch_agent_display(branch: str) -> str:
+    """Maps an octo-created branch name (AGENT_BRANCH_PREFIX + '<agent_binary>-<tag>', see
+    worktree_manager.create_agent_worktree) back to its agent's display name (e.g. 'claude' ->
+    'Claude') for coloring via _agent_markup; falls back to the raw binary name if unrecognized."""
+    suffix = branch.split("/", 1)[-1]  # strip the AGENT_BRANCH_PREFIX namespace (e.g. 'octo/')
+    agent_binary = suffix.rsplit("-", 1)[0] if "-" in suffix else suffix  # tag has no dashes, so this is always the agent_binary
+    return _AGENT_DISPLAY_NAMES.get(agent_binary, agent_binary)
 
 
 def _dir_size_bytes(path: Path) -> int:
@@ -458,6 +478,110 @@ class ClearCacheConfirmScreen(ModalScreen[bool]):
         """Dismisses the modal with True (proceed) only if the Clear cache button was pressed."""
         event.stop()
         self.dismiss(event.button.id == "confirm")
+
+
+@dataclass
+class WorktreeSyncState:
+    """Tracks one registered agent worktree's turn-boundary sync status (see worktree_sync.py),
+    updated by EditWatcherApp._sync_worktree and rendered by BranchesScreen."""
+    path: Path                     # worktree clone path, per WorktreeRegistration
+    branch: str                      # branch checked out there
+    agent: str                         # display name of the agent that created it (e.g. "Claude")
+    last_synced_sha: str | None = None    # worktree HEAD as of the last successful up_sync; None before any turn has landed
+    status: str = "ok"                      # "ok" | "syncing" | "paused" -- paused means a conflict needs a manual retry
+    detail: str = ""                          # last SyncResult.detail, shown alongside status
+    session_id: str = ""                        # most recent Stop-hook session id seen for this worktree, reused by a manual retry
+    transcript_path: str = ""                     # most recent Stop-hook transcript path seen, for read_last_prompt on a manual retry
+
+    @property
+    def status_suffix(self) -> str:
+        """Dim status text appended to this worktree's BranchesScreen line; '' when nothing worth
+        flagging (ok with no changes to report)."""
+        if self.status == "syncing":
+            return "  [dim](syncing...)[/dim]"
+        if self.status == "paused":
+            return f"  [dim](paused: {escape(self.detail)} -- press 'r' to retry)[/dim]"
+        return ""
+
+
+def _worktree_line(info: WorktreeInfo, theme: Theme, sync_state: WorktreeSyncState | None) -> str:
+    """Renders one WorktreeInfo as a two-line entry: agent-colored label (HUMAN_AGENT_LABEL for
+    the main working tree, else the creating agent's display name) + branch + short commit sha on
+    the first line (plus a sync-status suffix if sync_state says there's something to flag), dim
+    worktree path on the second."""
+    label = HUMAN_AGENT_LABEL if info.is_main else _branch_agent_display(info.branch)
+    branch_display = info.branch or "(detached HEAD)"
+    suffix = "  [dim](main working tree)[/dim]" if info.is_main else ""
+    status_suffix = sync_state.status_suffix if sync_state is not None else ""
+    return (
+        f"{_agent_markup(label, theme)}  [bold]{escape(branch_display)}[/bold]  "
+        f"[dim]{info.commit[:8]}[/dim]{suffix}{status_suffix}\n"
+        f"  [dim]{escape(str(info.path))}[/dim]"
+    )
+
+
+class BranchesScreen(Screen[None]):
+    """Full-screen overview of every currently-running worktree/branch for the watched repo --
+    the main working tree plus every agent worktree (see worktree_manager.list_agent_worktrees) --
+    a live snapshot, re-queried on an interval while open since a listed agent session can end
+    (and its worktree get cleaned up by agent_launcher's post-exit cleanup) at any moment."""
+
+    CSS = """
+    BranchesScreen #branches-list {
+        padding: 1 2;
+    }
+    BranchesScreen #branches-list Static {
+        height: auto;
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Back"),
+        Binding(BRANCHES_KEY, "close", "Back"),
+        Binding(RETRY_SYNC_KEY, RETRY_SYNC_ACTION, "Retry sync"),
+    ]
+
+    def __init__(self, repo_root: Path):
+        super().__init__()
+        self.repo_root = repo_root  # repo whose worktrees are listed, per worktree_manager.list_agent_worktrees
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield VerticalScroll(id="branches-list")
+        yield Footer()
+
+    def on_mount(self):
+        """Renders the initial snapshot, then keeps it live for as long as this screen stays open."""
+        self.title = f"octo -- branches -- {self.repo_root}"
+        self._refresh()
+        self.set_interval(BRANCHES_REFRESH_SECONDS, self._refresh)
+
+    def _refresh(self):
+        """Re-queries live worktrees and re-renders the list from scratch -- cheap at the scale of
+        a handful of concurrent agent sessions, so no need to diff against the previous render.
+        Each entry's sync status comes from the app's own live WorktreeSyncState tracking (see
+        EditWatcherApp._worktree_states), not from disk -- there's nothing on disk that says
+        "paused"."""
+        worktrees = list_agent_worktrees(self.repo_root)
+        container = self.query_one("#branches-list", VerticalScroll)
+        container.remove_children()
+        if not worktrees:
+            container.mount(Static("[dim]No worktrees found.[/dim]", markup=True))
+            return
+        for info in worktrees:
+            sync_state = self.app.worktree_states.get(info.path)
+            container.mount(Static(_worktree_line(info, self.app.current_theme, sync_state), markup=True))
+
+    def action_close(self):
+        self.dismiss(None)
+
+    def action_retry_paused(self):
+        """Re-dispatches sync for every currently-paused worktree -- stands in for full in-UI
+        conflict resolution (see WORKTREE_SYNC_PLAN.md's Conflict handling): the human is expected
+        to have actually resolved whatever caused the conflict (e.g. by hand-editing the worktree
+        or root) before pressing this, same as the doc's pause-for-human path assumes."""
+        self.app.retry_paused_worktrees()
 
 
 @dataclass
@@ -765,6 +889,9 @@ class EditWatcherApp(App):
         Binding(
             IGNORE_EDITOR_KEY, IGNORE_EDITOR_ACTION, "Edit ignore"
         ),  # opens interactive .octoignore editor
+        Binding(
+            BRANCHES_KEY, BRANCHES_ACTION, "Branches"
+        ),  # opens the running-agent-branches overview screen
     ]
 
     def __init__(self, root: Path, cwd: str, agent: str):
@@ -772,10 +899,14 @@ class EditWatcherApp(App):
         self.root = root  # directory whose files are watched for changes
         self.cwd = cwd  # agent cwd whose sessions to tail
         self.agent_filter = agent  # which agent(s) to correlate against ('both' = all)
+        self.pid = os.getpid()  # this process's pid -- matches what register() advertised, so drain_pending_worktrees reads our own inbox
         self.file_watcher = ShadowGitWatcher(
             root
         )  # detects settled fs changes via a shadow git repo
         self.tailers: list = []  # per-agent transcript tailers, built on mount
+        self._worktree_states: dict[Path, WorktreeSyncState] = {}  # worktree path -> its turn-boundary sync status, seeded on registration, updated by _sync_worktree; read by BranchesScreen
+        self._root_lane = RootLane()  # serializes commit_dirty() against worktree_sync's up-sync file-apply step, since _sync_worktree runs on its own @work worker
+        self._repo_root: Path | None = None  # real git repo root behind self.root, resolved lazily on the first worktree registration (self.root need not itself be a git repo)
         self._groups: dict[
             tuple[str, str], PromptGroup
         ] = {}  # (session_id, prompt) -> header group new matching edits append into
@@ -853,6 +984,10 @@ class EditWatcherApp(App):
         dirty on disk -- octo-generated revert commits (see ShadowGitWatcher.revert_file_to) are
         split out and rendered under their own rolling 'octo' group, everything else (unexplained
         human writes) renders as an ordinary Human flush."""
+        for registration in drain_pending_worktrees(self.pid):
+            self._render_worktree_registration(registration)
+        for turn_ended in drain_pending_turn_ends(self.pid):
+            self._handle_turn_ended(turn_ended)
         added_shell_activity = False  # tracks whether this cycle buffered anything, so pruning only runs when it can matter
         for tailer in self.tailers:
             result = tailer.poll().filter_since(
@@ -881,8 +1016,18 @@ class EditWatcherApp(App):
                 added_shell_activity = True
         if added_shell_activity:
             self._prune_shell_activity()
+        with self._root_lane:
+            self._process_commit_dirty(self.file_watcher.commit_dirty())
+
+    def _process_commit_dirty(self, settled_list: list[SettledEdit]):
+        """Renders one commit_dirty() batch: octo-generated revert commits (see
+        ShadowGitWatcher.revert_file_to) are split out and rendered under their own rolling
+        'octo' group, everything else (unexplained human writes -- including any up-synced files
+        _land_up_synced_edits hasn't already claimed via attribute_settled) renders as an
+        ordinary Human flush. Shared by poll_once's own tick and _sync_worktree's up-sync landing,
+        both of which call commit_dirty() from inside self._root_lane."""
         human_settled = []  # commit_dirty() output not explained by a revert -- rendered as an ordinary Human flush
-        for settled in self.file_watcher.commit_dirty():
+        for settled in settled_list:
             reverted_sha = self.file_watcher.get_reverted_commit(settled.commit)
             if reverted_sha is not None:
                 self._render_octo_revert(settled, reverted_sha)
@@ -894,6 +1039,96 @@ class EditWatcherApp(App):
         """True if file_path lives inside self.root -- the shadow repo has no baseline outside
         it, so attribute()/attribute_move() can't be called on such a path (relative_to() would raise)."""
         return Path(file_path).is_relative_to(self.root)
+
+    @property
+    def worktree_states(self) -> dict[Path, WorktreeSyncState]:
+        """Live per-worktree sync status, read by BranchesScreen -- there's nothing on disk that
+        says a worktree is paused, so this is the only source of truth for it."""
+        return self._worktree_states
+
+    def _render_worktree_registration(self, registration: WorktreeRegistration):
+        """Mounts one plain notification line into the feed for a worktree an `octo run` invocation
+        just created and registered (see session_registry.register_worktree), and seeds its
+        WorktreeSyncState -- from here on, a Stop-hook notification naming this path (see
+        _handle_turn_ended) drives its turn-boundary sync. Also resolves self._repo_root on first
+        sight, lazily: self.root need not itself be a git repo, but a worktree registration having
+        arrived at all proves it (or an ancestor of it) is one (see worktree_manager.repo_root)."""
+        if self._repo_root is None:
+            self._repo_root = resolve_repo_root(self.root)
+        self._worktree_states[registration.worktree_path] = WorktreeSyncState(
+            registration.worktree_path, registration.branch, registration.agent
+        )
+        line = (
+            f"{_agent_markup(registration.agent, self.current_theme)} "
+            f"worktree registered: {escape(str(registration.worktree_path))} "
+            f"[dim](branch {escape(registration.branch)})[/dim]"
+        )
+        self.query_one("#feed", VerticalScroll).mount(Static(line, markup=True))
+        self._scroll_feed_to_end()
+
+    def _handle_turn_ended(self, turn_ended: TurnEnded):
+        """Looks up the worktree a Stop-hook notification names and dispatches its turn-boundary
+        sync -- silently ignored if the worktree isn't (or is no longer) one this process tracks,
+        e.g. a stale notification for a worktree agent_launcher's post-exit cleanup already
+        removed."""
+        state = self._worktree_states.get(turn_ended.worktree_path)
+        if state is None:
+            return
+        state.session_id = turn_ended.session_id
+        state.transcript_path = turn_ended.transcript_path
+        self._sync_worktree(state)
+
+    def retry_paused_worktrees(self):
+        """Re-dispatches sync for every currently-paused worktree this app tracks -- the manual
+        retry BranchesScreen's action_retry_paused triggers, standing in for full in-UI conflict
+        resolution (delegation back to the agent is out of scope for now -- see
+        WORKTREE_SYNC_PLAN.md's Conflict handling)."""
+        for state in self._worktree_states.values():
+            if state.status == "paused":
+                self._sync_worktree(state)
+
+    @work
+    async def _sync_worktree(self, state: WorktreeSyncState):
+        """Runs one worktree's turn-boundary sequence: up-sync (land its new commits into root,
+        if any), then down-sync (rebase it onto root's latest, root always winning) -- down-sync
+        is skipped if up-sync conflicted, per WORKTREE_SYNC_PLAN.md's sequencing. Root-mutating
+        work (up-sync's file-apply step and the commit_dirty() it triggers) runs inside
+        self._root_lane, so it can't interleave with poll_once's own commit_dirty() tick."""
+        assert self._repo_root is not None, "a worktree registration always resolves _repo_root before any turn-boundary signal can arrive"
+        state.status = "syncing"
+        up_result = up_sync(state.path, state.branch, self._repo_root, state.last_synced_sha)
+        if not up_result.ok:
+            state.status = "paused"  # covers both a real conflict and a plain failure (e.g. fetch error) -- either way, surface it rather than silently drop the detail and retry unannounced
+            state.detail = up_result.detail
+            return
+        state.last_synced_sha = up_result.synced_sha
+        if up_result.changed_paths:
+            with self._root_lane:
+                self._land_up_synced_edits(state, up_result.changed_paths)
+        down_result = down_sync(state.path, self._repo_root)
+        state.status = "paused" if not down_result.ok else "ok"
+        state.detail = down_result.detail
+
+    def _land_up_synced_edits(self, state: WorktreeSyncState, changed_paths: list[str]):
+        """Commits up_sync's file-apply result via the normal commit_dirty() pipeline (shared
+        with poll_once via _process_commit_dirty, so a human edit that happened to settle in the
+        same tick still renders correctly as a Human flush, not swallowed here), then tags just
+        the paths this up-sync actually landed with the worktree's agent/session/prompt -- via
+        attribute_settled -- and renders each through the existing _render_agent_edit path, same
+        as any other attributed agent edit."""
+        assert self._repo_root is not None, "a worktree registration always resolves _repo_root before any turn-boundary signal can arrive"
+        # changed_paths are relative to the real git repo root (self._repo_root), which may differ
+        # from self.root if octo is watching a subdirectory of the repo -- resolve against
+        # _repo_root, not self.root, to match SettledEdit.file_path correctly either way.
+        changed_abs = {str(self._repo_root / rel) for rel in changed_paths}
+        settled_list = self.file_watcher.commit_dirty()
+        prompt = read_last_prompt(state.transcript_path) if state.transcript_path else ""
+        for settled in settled_list:
+            if settled.file_path not in changed_abs:
+                continue  # not one of this up-sync's own files -- an unrelated human write settling in the same tick; _process_commit_dirty renders it as Human below
+            self.file_watcher.attribute_settled(settled, state.agent, state.session_id, prompt)
+            self._render_agent_edit(settled, ToolEdit(settled.settled_at, settled.file_path, state.session_id, prompt, state.agent, None))
+        self._process_commit_dirty([s for s in settled_list if s.file_path not in changed_abs])
 
     def _render_external_edit(self, edit: "ToolEdit | ShellMoveEdit", file_path: str):
         """Notes an agent write outside the watched tree under its session+prompt's header group,
@@ -1417,6 +1652,10 @@ class EditWatcherApp(App):
     def action_open_ignore_editor(self):
         """Bound to IGNORE_EDITOR_KEY; opens the interactive ignore pattern editor."""
         self._open_ignore_editor()
+
+    def action_show_branches(self):
+        """Bound to BRANCHES_KEY; opens the running-agent-branches overview screen."""
+        self.push_screen(BranchesScreen(self.root))
 
     def _find_editor(self) -> str | None:
         """Returns the first available editor from (nvim, emacs, vim, vi, nano), or None if none found."""

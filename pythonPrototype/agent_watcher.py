@@ -252,7 +252,7 @@ def _parse_timestamp(iso_timestamp: str) -> float:
     return datetime.strptime(iso_timestamp, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
 
 
-def _cwd_related(session_cwd: str, watched_cwd: str) -> bool:
+def cwd_related(session_cwd: str, watched_cwd: str) -> bool:
     """True if session_cwd and watched_cwd sit on the same directory chain -- equal, or one nested
     inside the other -- so a session started in a subdirectory of the watched root (octo's
     root recursively covers its whole subtree) or in an ancestor of it still correlates correctly,
@@ -339,10 +339,34 @@ def _extract_tool_result_ids(record: dict) -> list[str]:
             if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id")]
 
 
+def read_last_prompt(transcript_path: str) -> str:
+    """One-shot scan of a Claude Code transcript file for the most recent human-typed prompt,
+    reusing _extract_user_prompt's record parsing -- for a Stop hook's turn-boundary signal
+    (see session_registry.TurnEnded), whose payload already names the exact transcript_path, a
+    live continuous tailer per worktree isn't needed just to recover the prompt text for display.
+    Returns "" if the file is missing or carries no human prompt yet."""
+    path = Path(transcript_path)
+    if not path.is_file():
+        return ""
+    last_prompt = ""  # most recent human prompt line seen so far in this scan
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a truncated trailing line (e.g. file still being written); skip it
+            prompt_text = _extract_user_prompt(record)
+            if prompt_text is not None:
+                last_prompt = prompt_text
+    return last_prompt
+
+
 class ClaudeTranscriptTailer:
     """Incrementally reads new lines appended to *.jsonl transcripts across every Claude Code
     project directory, keeping only the sessions whose recorded cwd is related to ours (see
-    _cwd_related) -- a session started in a subdirectory of the watched root, or in an ancestor of
+    cwd_related) -- a session started in a subdirectory of the watched root, or in an ancestor of
     it, still correlates correctly. Every transcript line already carries its session's real cwd,
     so this checks that directly rather than trusting a single slug-derived project directory
     (which only ever matches an exact cwd string) -- the same shape of check CodexTranscriptTailer
@@ -395,7 +419,7 @@ class ClaudeTranscriptTailer:
         record = json.loads(line)  # one transcript event: a user turn, assistant turn, or tool result
         record_cwd = record.get("cwd")
         if record_cwd is not None:
-            self._matches_cwd[transcript_path] = _cwd_related(record_cwd, self.cwd)
+            self._matches_cwd[transcript_path] = cwd_related(record_cwd, self.cwd)
         if not self._matches_cwd.get(transcript_path, False):
             return PollResult.empty()  # cwd for this session not yet confirmed as ours, or confirmed unrelated
         if record.get("type") not in ("user", "assistant"):
@@ -688,7 +712,7 @@ class CodexTranscriptTailer:
 
     Codex has no per-project transcript directory like Claude Code: every session on the machine
     lands under one dated tree (~/.codex/sessions/YYYY/MM/DD/), so each file's declared cwd must
-    be checked against ours (see _cwd_related) before any of its events are trusted -- a session
+    be checked against ours (see cwd_related) before any of its events are trusted -- a session
     started in a subdirectory of the watched root, or in an ancestor of it, still correlates
     correctly, unlike a bare exact-string cwd match.
     """
@@ -741,7 +765,7 @@ class CodexTranscriptTailer:
         if record.get("type") == "session_meta":
             payload = record.get("payload", {})  # session_meta payload carries the cwd Codex was invoked in
             session_cwd = payload.get("cwd")
-            self._matches_cwd[path] = session_cwd is not None and _cwd_related(session_cwd, self.cwd)
+            self._matches_cwd[path] = session_cwd is not None and cwd_related(session_cwd, self.cwd)
             self._session_ids[path] = payload.get("session_id", "")
             return PollResult.empty()
         if not self._matches_cwd.get(path, False):

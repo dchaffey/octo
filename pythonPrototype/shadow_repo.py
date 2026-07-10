@@ -180,6 +180,17 @@ class ShadowGitWatcher:
             settled.append(self._settle_move_half(dst_sha, dst_rel, move))
         return settled
 
+    def attribute_settled(self, settled: SettledEdit, agent: str, session_id: str, prompt: str):
+        """Tags an already-committed SettledEdit (e.g. from commit_dirty()) with agent/session/
+        prompt notes, for a caller that already knows the exact commit sha up front -- unlike
+        attribute(), which searches for a matching commit via content-probing because it only has
+        a transcript's ToolEdit to go on. Used by worktree_sync.py's up-sync landing path to
+        attribute a merged-in file's shadow commit to the worktree agent that produced it, instead
+        of leaving it attributed to the default "Human"."""
+        assert self._initialized, "initialize() must run before attribute_settled(), so a baseline exists to diff against"
+        edit = ToolEdit(settled.settled_at, settled.file_path, session_id, prompt, agent, None)
+        self._add_note(settled.commit, edit)
+
     def _settle_move_half(self, sha: str, rel: str, move: ShellMoveEdit) -> SettledEdit:
         """Builds a note-ready ToolEdit for one verified half of an mv/cp and annotates it."""
         edit = ToolEdit(move.timestamp, str(self.root / rel), move.session_id, move.prompt, move.agent, None)

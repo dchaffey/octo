@@ -51,6 +51,17 @@ python3 pythonPrototype/octo.py [root] [--cwd CWD]
 - `root` — directory to watch for edits (defaults to the current directory)
 - `--cwd` — agent working directory whose sessions to correlate against (defaults to `root`)
 
+To launch an agent CLI in its own isolated git worktree (so its tool use never touches the real
+project directory directly), run it through octo instead of invoking it directly:
+
+```
+python3 pythonPrototype/octo.py run <agent> [agent-args...]
+```
+
+- `agent` — `claude`, `codex`, or `agy` (or their display names — `Claude`, `Codex`, `Antigravity` — matched case-insensitively)
+- `agent-args` — forwarded untouched to the real agent CLI
+- requires a running `octo [root]` watching the current directory (or a parent/child of it); creates a fresh worktree and branch for this invocation and execs the real agent CLI there
+
 ### Building a standalone binary
 
 The prototype ships a PyInstaller spec (`pythonPrototype/octo.spec`) that bundles
