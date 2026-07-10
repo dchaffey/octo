@@ -55,7 +55,7 @@ from agent_watcher import ShellActivity, ShellMoveEdit, ToolEdit, build_tailers,
 from root_lane import RootLane
 from session_registry import TurnEnded, WorktreeRegistration, drain_pending_turn_ends, drain_pending_worktrees
 from shadow_repo import AffectedCommit, HistoryEntry, OCTOIGNORE_FILENAME, SettledEdit, ShadowGitWatcher
-from worktree_manager import WorktreeInfo, list_agent_worktrees, repo_root as resolve_repo_root
+from worktree_manager import WorktreeInfo, list_agent_worktrees
 from worktree_sync import down_sync, up_sync
 
 POLL_INTERVAL_SECONDS = 0.5  # how often the app re-scans watched files and transcripts
@@ -906,7 +906,6 @@ class EditWatcherApp(App):
         self.tailers: list = []  # per-agent transcript tailers, built on mount
         self._worktree_states: dict[Path, WorktreeSyncState] = {}  # worktree path -> its turn-boundary sync status, seeded on registration, updated by _sync_worktree; read by BranchesScreen
         self._root_lane = RootLane()  # serializes commit_dirty() against worktree_sync's up-sync file-apply step, since _sync_worktree runs on its own @work worker
-        self._repo_root: Path | None = None  # real git repo root behind self.root, resolved lazily on the first worktree registration (self.root need not itself be a git repo)
         self._groups: dict[
             tuple[str, str], PromptGroup
         ] = {}  # (session_id, prompt) -> header group new matching edits append into
@@ -1050,11 +1049,7 @@ class EditWatcherApp(App):
         """Mounts one plain notification line into the feed for a worktree an `octo run` invocation
         just created and registered (see session_registry.register_worktree), and seeds its
         WorktreeSyncState -- from here on, a Stop-hook notification naming this path (see
-        _handle_turn_ended) drives its turn-boundary sync. Also resolves self._repo_root on first
-        sight, lazily: self.root need not itself be a git repo, but a worktree registration having
-        arrived at all proves it (or an ancestor of it) is one (see worktree_manager.repo_root)."""
-        if self._repo_root is None:
-            self._repo_root = resolve_repo_root(self.root)
+        _handle_turn_ended) drives its turn-boundary sync."""
         self._worktree_states[registration.worktree_path] = WorktreeSyncState(
             registration.worktree_path, registration.branch, registration.agent
         )
@@ -1094,9 +1089,8 @@ class EditWatcherApp(App):
         is skipped if up-sync conflicted, per WORKTREE_SYNC_PLAN.md's sequencing. Root-mutating
         work (up-sync's file-apply step and the commit_dirty() it triggers) runs inside
         self._root_lane, so it can't interleave with poll_once's own commit_dirty() tick."""
-        assert self._repo_root is not None, "a worktree registration always resolves _repo_root before any turn-boundary signal can arrive"
         state.status = "syncing"
-        up_result = up_sync(state.path, state.branch, self._repo_root, state.last_synced_sha)
+        up_result = up_sync(state.path, state.branch, self.file_watcher.git_dir, self.root, state.last_synced_sha)
         if not up_result.ok:
             state.status = "paused"  # covers both a real conflict and a plain failure (e.g. fetch error) -- either way, surface it rather than silently drop the detail and retry unannounced
             state.detail = up_result.detail
@@ -1105,7 +1099,7 @@ class EditWatcherApp(App):
         if up_result.changed_paths:
             with self._root_lane:
                 self._land_up_synced_edits(state, up_result.changed_paths)
-        down_result = down_sync(state.path, self._repo_root)
+        down_result = down_sync(state.path, self.file_watcher.git_dir)
         state.status = "paused" if not down_result.ok else "ok"
         state.detail = down_result.detail
 
@@ -1116,11 +1110,9 @@ class EditWatcherApp(App):
         the paths this up-sync actually landed with the worktree's agent/session/prompt -- via
         attribute_settled -- and renders each through the existing _render_agent_edit path, same
         as any other attributed agent edit."""
-        assert self._repo_root is not None, "a worktree registration always resolves _repo_root before any turn-boundary signal can arrive"
-        # changed_paths are relative to the real git repo root (self._repo_root), which may differ
-        # from self.root if octo is watching a subdirectory of the repo -- resolve against
-        # _repo_root, not self.root, to match SettledEdit.file_path correctly either way.
-        changed_abs = {str(self._repo_root / rel) for rel in changed_paths}
+        # changed_paths are relative to self.root -- up_sync's working_root, the same root this
+        # app's ShadowGitWatcher tracks -- so SettledEdit.file_path resolves against it directly.
+        changed_abs = {str(self.root / rel) for rel in changed_paths}
         settled_list = self.file_watcher.commit_dirty()
         prompt = read_last_prompt(state.transcript_path) if state.transcript_path else ""
         for settled in settled_list:

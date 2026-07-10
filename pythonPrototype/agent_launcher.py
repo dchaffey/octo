@@ -54,17 +54,18 @@ def run(identifier: str, passthrough: list[str]):
               f"Start one first, e.g.: octo {cwd}", file=sys.stderr)
         sys.exit(1)
 
-    handle = _redirect_into_worktree(session, agent, cwd)
+    handle = _redirect_into_worktree(session, agent)
     sys.exit(_run_agent_and_cleanup(str(binary_path), passthrough, handle))
 
 
-def _redirect_into_worktree(session, agent: str, cwd: Path) -> WorktreeHandle:
+def _redirect_into_worktree(session, agent: str) -> WorktreeHandle:
     """Creates this invocation's clone, tags it with the watching octo process's pid/root (so a
     Stop hook firing inside it later can find its way back -- see octo_hook.py), installs octo's
     hook config into it (fresh, not copied -- .claude/ etc. are gitignored, so nothing to inherit
     from the clone), and registers it with the watching octo process."""
-    handle = create_agent_worktree(cwd, agent)  # `agent` is the display name (e.g. "Claude"), which
-                                                 # becomes the on-disk branch/dir naming (octo/Claude-<tag>)
+    handle = create_agent_worktree(session.root, agent)  # cloned from session.root's shadow repo, not the real project .git
+                                                          # (see worktree_manager module docstring) -- `agent` is the display
+                                                          # name (e.g. "Claude"), which becomes the on-disk branch/dir naming
     write_owner_marker(handle.path, session.pid, session.root)
     detect_and_install_hooks(handle.path)
     register_worktree(session, handle.path, handle.branch, agent)  # hands the new worktree off to the watching octo process's next poll tick

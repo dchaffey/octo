@@ -458,8 +458,13 @@ class ShadowGitWatcher:
         self._git("notes", "append", "-m", f"{REVERTED_BY_TRAILER}{revert_commit}", original_commit)
 
     def _dirty_paths(self) -> set[str]:
-        """Returns paths (relative to root) that differ from the shadow repo's last commit."""
-        status = self._git("status", "--porcelain")
+        """Returns paths (relative to root) that differ from the shadow repo's last commit. Uses
+        --untracked-files=all so a brand-new directory is expanded to the individual files inside
+        it, rather than collapsed to one line naming the directory itself (plain --porcelain's
+        default) -- every caller here (last_commit_for_path, attribute()'s walk-back, up_sync's
+        changed_paths matching in octo_tui._land_up_synced_edits) assumes rel always names a file,
+        never a directory."""
+        status = self._git("status", "--porcelain", "--untracked-files=all")
         return {line[3:] for line in status.stdout.splitlines()}
 
 

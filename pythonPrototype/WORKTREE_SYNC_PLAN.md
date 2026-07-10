@@ -4,14 +4,28 @@ Design for keeping each agent's isolated clone (see `worktree_manager.py`) in sy
 with the real project (`root`), and for landing an agent's finished work back into
 `root`, without ever blocking or corrupting the human's live working tree.
 
+**Root's real project `.git` is never touched by any of this.** Every "sync against
+root" below actually means sync against `root`'s *shadow* repo (`root/.octo`, see
+`shadow_repo.SHADOW_DIR_NAME`) — a separate, real git repo whose work-tree is `root`
+and whose `ShadowGitWatcher.commit_dirty()` keeps its HEAD an accurate, near-real-time
+git-committed snapshot of what's actually on disk. The real project `.git` is only
+ever whatever the human last committed manually, and can be arbitrarily stale/
+divergent from current disk state (uncommitted edits, uncommitted deletions, ...) —
+cloning/rebasing/merging against it instead would check that stale tree out into
+every fresh agent worktree, resurrecting files the human already deleted on disk but
+never committed away. Landing an up-synced change still means writing real bytes
+onto `root`'s real working tree (the human-visible files); it's only the ref/ancestry
+side of every sync operation that's anchored to `.octo` instead of the real `.git`.
+
 ## Model: hub and spoke
 
 - `root` is the hub. It's the directory the human directly edits and the only
   authority — it never gets synced *against* anything else, it only ever receives
   commits (human writes, and validated agent merges).
-- Each agent worktree (an independent `git clone`, per `create_agent_worktree` in
-  `worktree_manager.py`) is a spoke. Spokes sync down from `root` and submit up to
-  `root`; they never sync with each other directly.
+- Each agent worktree (an independent `git clone` of `root/.octo`, per
+  `create_agent_worktree` in `worktree_manager.py`) is a spoke. Spokes sync down from
+  `root`'s shadow repo and submit up to `root`'s real working tree; they never sync
+  with each other directly.
 
 ## Down-sync: root -> agent worktree
 
