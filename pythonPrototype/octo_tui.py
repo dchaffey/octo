@@ -40,8 +40,10 @@ from root_lane import RootLane
 from session_registry import (
     TurnEnded,
     WorktreeRegistration,
+    SyncEvent,
     drain_pending_turn_ends,
     drain_pending_worktrees,
+    drain_pending_syncs,
 )
 from shadow_repo import (
     OCTOIGNORE_FILENAME,
@@ -648,6 +650,8 @@ class PromptGroup(Vertical):
         prompt: str,
         empty_note: str = HUMAN_EMPTY_NOTE,
         preceding_prompts: list[tuple[float, str]] | None = None,
+        session_id: str = "",
+        branch: str = "",
     ):
         super().__init__()
         self.timestamp = timestamp  # epoch seconds of this group's first edit; fixed once the group is created
@@ -659,6 +663,8 @@ class PromptGroup(Vertical):
         self.preceding_prompts = (
             preceding_prompts or []
         )  # (timestamp, prompt_text) tuples for prompts before this one that didn't cause changes
+        self.session_id = session_id  # originating session id if agent-attributed, else ""
+        self.branch = branch          # originating worktree branch if agent-attributed, else ""
         self._change_count = (
             0  # tracked separately from self.children: Widget.remove() is queued, not
         )
@@ -712,7 +718,22 @@ class PromptGroup(Vertical):
             "%H:%M:%S", time.localtime(self.timestamp)
         )  # wall-clock time of this group
         stats = f"[green]+{self._added_total}[/green] [red]-{self._removed_total}[/red]"
-        return f"[bold]{header_time}[/bold]  {_agent_markup(self.agent, self.app.current_theme)}  {stats}"
+        
+        # Determine if there's a branch/worktree label to display
+        branch_display = ""
+        # 1. Check if self.branch is directly set
+        if self.branch:
+            clean_branch = self.branch.removeprefix("octo/")
+            branch_display = f" [dim]({clean_branch})[/dim]"
+        # 2. Otherwise, look it up in the app's worktree_states using session_id
+        elif self.session_id and hasattr(self, "app") and self.app is not None:
+            for state in self.app.worktree_states.values():
+                if state.session_id == self.session_id:
+                    clean_branch = state.branch.removeprefix("octo/")
+                    branch_display = f" [dim]({clean_branch})[/dim]"
+                    break
+
+        return f"[bold]{header_time}[/bold]  {_agent_markup(self.agent, self.app.current_theme)}{branch_display}  {stats}"
 
     def _refresh_title(self):
         """Re-renders the title line after add_change/remove_change change the line-change totals."""
@@ -855,12 +876,22 @@ class EditBlock(Vertical):
         return len(self._groups) == 0
 
 
+class RegistrationBlock(Vertical):
+    """Bordered container for one worktree registration, styled like EditBlock."""
+    pass
+
+
+class SyncBlock(Vertical):
+    """Bordered container for one worktree sync notification, styled like EditBlock."""
+    pass
+
+
 class EditWatcherApp(App):
     """Live Textual view of octo's attributed edits, one bordered block per streak of
     consecutive Human or consecutive agent commits."""
 
     CSS = """
-    EditBlock {
+    EditBlock, RegistrationBlock, SyncBlock {
         border: round $accent;
         margin: 0 1 1 1;
         padding: 0 1;
@@ -999,11 +1030,13 @@ class EditWatcherApp(App):
 
     def poll_once(self):
         """One drain pass: processes turn-boundary signals (worktree + root-lane),
-        then commits whatever's still dirty on disk."""
+        sync events, then commits whatever's still dirty on disk."""
         for registration in drain_pending_worktrees(self.pid):
             self._render_worktree_registration(registration)
         for turn_ended in drain_pending_turn_ends(self.pid):
             self._handle_turn_ended(turn_ended)
+        for sync in drain_pending_syncs(self.pid):
+            self._handle_sync_event(sync)
         with self._root_lane:
             self._process_commit_dirty(self.file_watcher.commit_dirty())
 
@@ -1041,13 +1074,48 @@ class EditWatcherApp(App):
         self._worktree_states[registration.worktree_path] = WorktreeSyncState(
             registration.worktree_path, registration.branch, registration.agent
         )
+        self._current_human_block = None
+        self._current_agent_block = None
+        self._human_group = None
+        self._current_octo_group = None
+        self._current_octo_key = None
+
+        block = RegistrationBlock()
+        self.query_one("#feed", VerticalScroll).mount(block)
+
         line = (
             f"{_agent_markup(registration.agent, self.current_theme)} "
             f"worktree registered: {escape(str(registration.worktree_path))} "
             f"[dim](branch {escape(registration.branch)})[/dim]"
         )
-        self.query_one("#feed", VerticalScroll).mount(Static(line, markup=True))
+        block.mount(Static(line, markup=True))
         self._scroll_feed_to_end()
+
+    def _handle_sync_event(self, sync: SyncEvent):
+        """Mounts one sync notification line into the feed showing the status of a worktree sync."""
+        self._current_human_block = None
+        self._current_agent_block = None
+        self._human_group = None
+        self._current_octo_group = None
+        self._current_octo_key = None
+
+        block = SyncBlock()
+        self.query_one("#feed", VerticalScroll).mount(block)
+
+        status_str = "[green]SUCCESS[/green]" if sync.ok else "[red]FAILED[/red]"
+        detail_str = f" ({sync.detail})" if sync.detail else ""
+        line = (
+            f"{_agent_markup(sync.agent_name, self.current_theme)} "
+            f"worktree sync: {escape(str(sync.worktree_path))} -> {status_str}{detail_str}"
+        )
+        block.mount(Static(line, markup=True))
+        self._scroll_feed_to_end()
+
+        # Update the tracked worktree's state in BranchesScreen
+        state = self._worktree_states.get(sync.worktree_path)
+        if state is not None:
+            state.status = "ok" if sync.ok else "paused"
+            state.detail = sync.detail
 
     def _handle_turn_ended(self, turn_ended: TurnEnded):
         """Dispatches a Stop-hook turn-boundary signal: worktree-lane if worktree_path names a
@@ -1169,7 +1237,7 @@ class EditWatcherApp(App):
             if settled.file_path not in changed_abs:
                 continue  # not one of this up-sync's own files -- an unrelated human write settling in the same tick; _process_commit_dirty renders it as Human below
             self.file_watcher.attribute_settled(
-                settled, state.agent, state.session_id, prompt
+                settled, state.agent, state.session_id, prompt, branch=state.branch
             )
             self._render_agent_edit(
                 settled,
@@ -1181,6 +1249,7 @@ class EditWatcherApp(App):
                     state.agent,
                     None,
                 ),
+                branch=state.branch,
             )
         self._process_commit_dirty(
             [s for s in settled_list if s.file_path not in changed_abs]
@@ -1255,7 +1324,7 @@ class EditWatcherApp(App):
         self._scroll_feed_to_end()
         self._update_clear_cache_binding()
 
-    def _render_agent_edit(self, settled: SettledEdit, edit: ToolEdit | ShellMoveEdit):
+    def _render_agent_edit(self, settled: SettledEdit, edit: ToolEdit | ShellMoveEdit, branch: str = ""):
         """Appends a reattributed commit to its session+prompt's header group, opening a new group
         (and a new block, unless the trailing agent streak is still open) on first sight of that
         session+prompt; if the commit was already rendered under a Human block this session, moves
@@ -1274,7 +1343,7 @@ class EditWatcherApp(App):
         group = self._groups.get(key)
         if group is None:
             group = self._open_agent_group(
-                settled.settled_at, edit.agent, edit.prompt, key
+                settled.settled_at, edit.agent, edit.prompt, key, branch=branch
             )
         change = self._settled_to_filechange(
             settled.file_path, settled.diff, settled.commit
@@ -1377,7 +1446,7 @@ class EditWatcherApp(App):
         group.mark_reverted()
 
     def _open_agent_group(
-        self, timestamp: float, agent: str, prompt: str, key: tuple[str, str]
+        self, timestamp: float, agent: str, prompt: str, key: tuple[str, str], branch: str = ""
     ) -> PromptGroup:
         """Starts a header group for a not-yet-seen session+prompt, mounts the group into the
         trailing agent block if that streak is still open, else opens a fresh block first."""
@@ -1386,7 +1455,7 @@ class EditWatcherApp(App):
             block = EditBlock()
             self.query_one("#feed", VerticalScroll).mount(block)
             self._current_agent_block = block
-        group = PromptGroup(timestamp, agent, prompt)
+        group = PromptGroup(timestamp, agent, prompt, session_id=key[0], branch=branch)
         block.add_group(group)
         self._groups[key] = group
         return group
@@ -1456,7 +1525,7 @@ class EditWatcherApp(App):
                     streak_key = streak_key_new
                 group = groups.get(group_key)
                 if group is None:
-                    group = PromptGroup(entry.timestamp, label, prompt, empty_note=note)
+                    group = PromptGroup(entry.timestamp, label, prompt, empty_note=note, session_id=entry.session_id, branch=entry.branch)
                     block.add_group(group)
                     groups[group_key] = group
             change = self._settled_to_filechange(

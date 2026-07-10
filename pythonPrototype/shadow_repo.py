@@ -42,6 +42,7 @@ OCTOIGNORE_TEMPLATE = """# .octoignore — patterns of files and directories to 
 BASELINE_SUBJECT = "octo: baseline"  # first line of every initialize() commit, empty or not; marks a commit as a baseline in history()
 AGENT_TRAILER = "Agent: "               # note/legacy-message line marking a commit as agent-authored, and naming the agent
 SESSION_TRAILER = "Session: "             # note/legacy-message line carrying the originating session id
+BRANCH_TRAILER = "Branch: "               # note line carrying the originating worktree branch name
 REVERTED_BY_TRAILER = "Reverted by: "     # note line marking a commit as having been reverted
 REVERTS_TRAILER = "Reverts: "             # note line marking a commit as a revert of another
 WALK_BACK_LIMIT = 5  # how many recent commits touching a path attribute() searches before giving up
@@ -77,32 +78,48 @@ class HistoryEntry:
     session_id: str                # originating session id if agent-attributed, else ""
     prompt: str                       # prompt in effect if agent-attributed, else ""
     is_baseline: bool                   # true if this entry came from an initialize() baseline commit, not a write-watcher commit
+    branch: str = ""                    # originating worktree branch if agent-attributed and run in worktree
 
 
-def _note_text(edit: ToolEdit) -> str:
+def _note_text(edit: ToolEdit, branch: str = "") -> str:
     """Builds attribute()'s git-notes body: Agent/Session trailers plus the prompt, parsed back by _parse_attribution()."""
-    return f"{AGENT_TRAILER}{edit.agent}\n{SESSION_TRAILER}{edit.session_id}\n\n{edit.prompt}"
+    lines = [
+        f"{AGENT_TRAILER}{edit.agent}",
+        f"{SESSION_TRAILER}{edit.session_id}"
+    ]
+    if branch:
+        lines.append(f"{BRANCH_TRAILER}{branch}")
+    lines.append("")
+    lines.append(edit.prompt)
+    return "\n".join(lines)
 
 
-def _parse_attribution(text: str) -> tuple[str, str, str]:
-    """Extracts (agent, session_id, prompt) from a note body (_note_text) or a legacy commit message
-    (old _edit_commit_message shape) -- both share the same fixed trailer layout. Returns (agent, '', '')
+def _parse_attribution(text: str) -> tuple[str, str, str, str]:
+    """Extracts (agent, session_id, prompt, branch) from a note body (_note_text) or a legacy commit message
+    (old _edit_commit_message shape) -- both share the same fixed trailer layout. Returns (agent, '', '', '')
     for system commits (e.g. octo) that have no session. All '' if text doesn't have the expected shape."""
     lines = text.split("\n")
     if len(lines) < 1 or not lines[0].startswith(AGENT_TRAILER):
-        return "", "", ""
+        return "", "", "", ""
     agent = lines[0][len(AGENT_TRAILER):]
     # system agents (like octo) have no session or prompt
     if len(lines) < 2 or not lines[1].startswith(SESSION_TRAILER):
-        return agent, "", ""
+        return agent, "", "", ""
     session_id = lines[1][len(SESSION_TRAILER):]
+    
+    branch = ""
+    prompt_start_idx = 3
+    if len(lines) > 2 and lines[2].startswith(BRANCH_TRAILER):
+        branch = lines[2][len(BRANCH_TRAILER):]
+        prompt_start_idx = 4
+        
     prompt_lines: list[str] = []
-    for line in lines[3:]:  # lines[2] is the blank separator between trailers and prompt body
+    for line in lines[prompt_start_idx:]:  # lines[prompt_start_idx-1] is the blank separator between trailers and prompt body
         if line.startswith(REVERTED_BY_TRAILER) or line.startswith(REVERTS_TRAILER):
             break
         prompt_lines.append(line)
     prompt = "\n".join(prompt_lines).rstrip("\n")
-    return agent, session_id, prompt
+    return agent, session_id, prompt, branch
 
 
 class ShadowGitWatcher:
@@ -180,7 +197,7 @@ class ShadowGitWatcher:
             settled.append(self._settle_move_half(dst_sha, dst_rel, move))
         return settled
 
-    def attribute_settled(self, settled: SettledEdit, agent: str, session_id: str, prompt: str):
+    def attribute_settled(self, settled: SettledEdit, agent: str, session_id: str, prompt: str, branch: str = ""):
         """Tags an already-committed SettledEdit (e.g. from commit_dirty()) with agent/session/
         prompt notes, for a caller that already knows the exact commit sha up front -- unlike
         attribute(), which searches for a matching commit via content-probing because it only has
@@ -189,7 +206,7 @@ class ShadowGitWatcher:
         of leaving it attributed to the default "Human"."""
         assert self._initialized, "initialize() must run before attribute_settled(), so a baseline exists to diff against"
         edit = ToolEdit(settled.settled_at, settled.file_path, session_id, prompt, agent, None)
-        self._add_note(settled.commit, edit)
+        self._add_note(settled.commit, edit, branch)
 
     def _settle_move_half(self, sha: str, rel: str, move: ShellMoveEdit) -> SettledEdit:
         """Builds a note-ready ToolEdit for one verified half of an mv/cp and annotates it."""
@@ -242,11 +259,11 @@ class ShadowGitWatcher:
         expected_bytes = expected if isinstance(expected, bytes) else expected.encode("utf-8")  # full_content is str for real tool edits, bytes when replayed verbatim from _show_at (attribute_move)
         return self._show_at(sha, rel) == expected_bytes
 
-    def _add_note(self, sha: str, edit: ToolEdit):
+    def _add_note(self, sha: str, edit: ToolEdit, branch: str = ""):
         """Attaches edit's agent/session/prompt to sha as a git note; appends instead of clobbering if a note is already there."""
         existing = self._git("notes", "show", sha, check=False)
         subcommand = "append" if existing.returncode == 0 else "add"
-        self._git("notes", subcommand, "-m", _note_text(edit), sha)
+        self._git("notes", subcommand, "-m", _note_text(edit, branch), sha)
 
     def _commit_path(self, rel: str, reverted_commit: str | None = None) -> SettledEdit | None:
         """Stages and commits one dirty path as-is, no attribution; updates the fast-path index. If
@@ -363,19 +380,19 @@ class ShadowGitWatcher:
             if sha == until:
                 break  # reached this session's own baseline -- everything after is live activity, not prior-run history
             is_baseline = message.startswith(BASELINE_SUBJECT)
-            agent, session_id, prompt = self._attribution_for(sha, message, is_baseline)
+            agent, session_id, prompt, branch = self._attribution_for(sha, message, is_baseline)
             paths = [p for p in self._git("show", "--format=", "--name-only", sha).stdout.splitlines() if p]
             for path in paths:
                 diff = self._git("show", "--format=", sha, "--", path).stdout
-                entries.append(HistoryEntry(str(self.root / path), diff, float(at), sha, agent, session_id, prompt, is_baseline))
+                entries.append(HistoryEntry(str(self.root / path), diff, float(at), sha, agent, session_id, prompt, is_baseline, branch))
                 self.last_commit_for_path[path] = sha
         return entries
 
-    def _attribution_for(self, sha: str, message: str, is_baseline: bool) -> tuple[str, str, str]:
-        """Resolves a commit's (agent, session_id, prompt): git notes are the source of truth; falls back to
+    def _attribution_for(self, sha: str, message: str, is_baseline: bool) -> tuple[str, str, str, str]:
+        """Resolves a commit's (agent, session_id, prompt, branch): git notes are the source of truth; falls back to
         parsing the commit message itself for repos written before notes-based attribution existed."""
         if is_baseline:
-            return "", "", ""
+            return "", "", "", ""
         note = self._git("notes", "show", sha, check=False)
         if note.returncode == 0:
             return _parse_attribution(note.stdout)

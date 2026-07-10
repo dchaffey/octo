@@ -161,3 +161,58 @@ def drain_pending_turn_ends(pid: int) -> list[TurnEnded]:
             entry.get("agent_name", ""), entry["notified_at"],
         ))
     return turn_ends
+
+
+PENDING_SYNCS_DIR = Path.home() / ".octo" / "pending_syncs"
+
+
+@dataclass
+class SyncEvent:
+    """A sync result from a worktree (e.g. from down_sync triggered by UserPromptSubmit hook),
+    not yet drained by the octo process watching it."""
+    worktree_path: Path
+    agent_name: str
+    ok: bool
+    conflicted: bool
+    detail: str
+    notified_at: float
+
+
+def notify_sync(owner_pid: int, worktree_path: Path, agent_name: str,
+                ok: bool, conflicted: bool, detail: str) -> Path:
+    """Drops one SyncEvent for owner_pid's octo process to pick up on its next poll tick.
+    Returns the file path written."""
+    pending_dir = PENDING_SYNCS_DIR / str(owner_pid)
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    entry_path = pending_dir / f"{uuid.uuid4().hex}.json"
+    entry_path.write_text(json.dumps({
+        "worktree_path": str(worktree_path),
+        "agent_name": agent_name,
+        "ok": ok,
+        "conflicted": conflicted,
+        "detail": detail,
+        "notified_at": time.time(),
+    }), encoding="utf-8")
+    return entry_path
+
+
+def drain_pending_syncs(pid: int) -> list[SyncEvent]:
+    """Returns every SyncEvent dropped for the octo process with the given pid since the last
+    drain, deleting each entry file as it's read."""
+    pending_dir = PENDING_SYNCS_DIR / str(pid)
+    if not pending_dir.is_dir():
+        return []
+    syncs = []
+    for entry_path in sorted(pending_dir.glob("*.json")):
+        entry = json.loads(entry_path.read_text(encoding="utf-8"))
+        entry_path.unlink()
+        syncs.append(SyncEvent(
+            Path(entry["worktree_path"]),
+            entry.get("agent_name", ""),
+            entry["ok"],
+            entry["conflicted"],
+            entry["detail"],
+            entry["notified_at"],
+        ))
+    return syncs
+

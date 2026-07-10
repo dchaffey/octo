@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-from session_registry import find_matching_session, notify_turn_ended
+from session_registry import find_matching_session, notify_turn_ended, notify_sync
 from worktree_manager import read_owner_marker
 
 DEFAULT_AGENT = "Claude"  # only agent with confirmed Stop hooks today; Codex/Antigravity Stop events are unverified
@@ -18,11 +18,47 @@ DEFAULT_AGENT = "Claude"  # only agent with confirmed Stop hooks today; Codex/An
 
 def main():
     """Consumes the hook's JSON payload from stdin, dispatches on hook_event_name, and exits 0
-    unconditionally -- neither event type here can ever deny a write or block a turn from ending."""
+    unconditionally unless UserPromptSubmit's sync fails, in which case it blocks the prompt."""
     payload = json.loads(sys.stdin.read())
-    if payload.get("hook_event_name") == "Stop" and not payload.get("stop_hook_active", False):
+    event_name = payload.get("hook_event_name")
+    if event_name == "Stop" and not payload.get("stop_hook_active", False):
         _signal_turn_end(payload)
-    sys.exit(0)  # always approve/allow -- no gating or blocking logic yet, for either event type
+        sys.exit(0)
+    elif event_name == "UserPromptSubmit":
+        _handle_prompt_submit(payload)
+        sys.exit(0)
+    sys.exit(0)  # always approve/allow for other events like PreToolUse
+
+
+def _handle_prompt_submit(payload: dict):
+    """Fires at prompt submission: syncs the worktree branch from the root's shadow repo
+    before the agent begins thinking/planning. If the sync conflicts, returns a block decision
+    to Claude Code so it pauses/aborts the prompt turn."""
+    cwd = Path(payload["cwd"])
+    owner = read_owner_marker(cwd)
+    if owner is None:
+        # Not a worktree (root project lane). We don't down-sync root, so just approve.
+        print(json.dumps({"decision": "approve"}))
+        sys.exit(0)
+
+    from shadow_repo import SHADOW_DIR_NAME
+    from worktree_sync import down_sync
+
+    shadow_git_dir = Path(owner["root"]) / SHADOW_DIR_NAME
+
+    # Perform the down-sync synchronously
+    result = down_sync(cwd, shadow_git_dir)
+
+    # Notify the TUI of the sync event
+    notify_sync(owner["pid"], cwd, DEFAULT_AGENT, result.ok, result.conflicted, result.detail)
+
+    if not result.ok:
+        # Block Claude from proceeding
+        print(json.dumps({"decision": "block", "reason": f"Octo sync failed: {result.detail}"}))
+    else:
+        # Approve and let Claude proceed
+        print(json.dumps({"decision": "approve"}))
+    sys.exit(0)
 
 
 def _signal_turn_end(payload: dict):

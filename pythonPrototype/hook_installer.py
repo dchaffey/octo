@@ -105,20 +105,21 @@ def _install_hook_for_agent(agent_name: str, project_root: Path, relative_config
 
 
 def install_claude_hook(project_root: Path, hook_marker: str, hook_command: str) -> HookInstallResult:
-    """Installs octo's PreToolUse hook (placeholder, always approves) and its Stop hook (turn-
-    boundary signal for worktree_sync.py -- see octo_hook.py) into
-    <project_root>/.claude/settings.json, in one read-merge-merge-write pass so both entries land
-    in a single write. Schema confirmed against a live ~/.claude/settings.json on this machine
-    (PreToolUse) and against live docs (Stop -- see _merge_hook_entry)."""
+    """Installs octo's PreToolUse hook (placeholder, always approves), its Stop hook (turn-
+    boundary signal for worktree_sync.py -- see octo_hook.py), and its UserPromptSubmit hook
+    (prompt start boundary) into <project_root>/.claude/settings.json, in one read-merge-merge-merge-write
+    pass so all entries land in a single write. Schema confirmed against a live ~/.claude/settings.json
+    on this machine (PreToolUse) and against live docs (Stop, UserPromptSubmit -- see _merge_hook_entry)."""
     assert project_root.is_dir(), "Claude hook install requires an existing project directory"
     config_path = project_root / ".claude" / "settings.json"
     config = _read_json_config(config_path)
     matcher = "|".join((*EDIT_TOOL_NAMES, CLAUDE_SHELL_TOOL_NAME))  # single source of truth: which Claude tools write files
     config, pre_already = _merge_hook_entry(config, "PreToolUse", matcher, hook_marker, hook_command)
     config, stop_already = _merge_hook_entry(config, "Stop", None, hook_marker, hook_command)
-    if not (pre_already and stop_already):
+    config, submit_already = _merge_hook_entry(config, "UserPromptSubmit", None, hook_marker, hook_command)
+    if not (pre_already and stop_already and submit_already):
         _write_json_config(config_path, config)
-    return HookInstallResult("Claude", True, config_path, pre_already and stop_already)
+    return HookInstallResult("Claude", True, config_path, pre_already and stop_already and submit_already)
 
 
 def install_codex_hook(project_root: Path, hook_marker: str, hook_command: str) -> HookInstallResult:
