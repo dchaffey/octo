@@ -81,6 +81,21 @@ class HistoryEntry:
     branch: str = ""                    # originating worktree branch if agent-attributed and run in worktree
 
 
+@dataclass
+class GraphCommit:
+    """One commit summarized for the commit-graph screen -- no diffs, so graph_commits() can be
+    re-run cheaply on a refresh interval. commit_detail() fetches the per-file diffs lazily only
+    when a node is clicked."""
+    sha: str            # shadow-repo commit sha
+    timestamp: float    # commit's author time, epoch seconds
+    agent: str          # agent name if attributed, else "" (human or baseline)
+    session_id: str     # originating session id if agent-attributed, else ""
+    prompt: str         # prompt in effect if agent-attributed, else ""
+    branch: str         # originating worktree branch if agent-attributed and run in a worktree, else ""
+    is_baseline: bool   # true if this is an initialize() baseline commit
+    file_count: int     # number of files this commit touched, for a summary count on the graph row
+
+
 def _note_text(edit: ToolEdit, branch: str = "") -> str:
     """Builds attribute()'s git-notes body: Agent/Session trailers plus the prompt, parsed back by _parse_attribution()."""
     lines = [
@@ -147,6 +162,41 @@ class ShadowGitWatcher:
         settled = [self._commit_path(path, self._pending_reverts.get(path)) for path in sorted(self._dirty_paths())]
         self._pending_reverts.clear()
         return [s for s in settled if s is not None]  # drop no-op commits (see _commit_path)
+
+    def commit_landing(self, rels: list[str], agent: str, session_id: str, prompt: str,
+                       branch: str = "") -> list[SettledEdit]:
+        """Commits exactly rels as ONE shadow commit attributed to a worktree agent, returning a
+        SettledEdit per rel that actually changed -- all sharing that single commit sha.
+
+        Unlike commit_dirty()'s per-path loop, an up-sync lands an agent's whole prompt as one
+        atomic unit (up_sync's 3-way merge already succeeds or aborts as a whole), so it records as
+        a single commit rather than N per-file commits that fragment one prompt across the graph
+        (graph_commits/commit_detail already read a multi-file commit correctly). The per-rel
+        SettledEdits still let octo_tui's live feed render each changed file individually off the
+        same sha. rels are the exact paths up_sync applied onto the working tree -- adds, edits, and
+        deletes -- and `git add -A --` stages the deletions among them too. Attribution is a single
+        git note on the commit, the same trailer layout attribute_settled writes and _attribution_for
+        parses back. Returns [] if the landing was a no-op (every rel already matched HEAD, e.g. an
+        identical human write beat it in) -- caller then renders nothing this turn."""
+        assert self._initialized, "initialize() must run before commit_landing(), so a baseline exists to diff against"
+        assert rels, "commit_landing requires at least one path -- caller only calls it for a non-empty landing"
+        self._git("add", "-A", "--", *rels)  # stages adds/edits/deletes among exactly these paths, nothing else dirty
+        result = self._git("commit", "-q", "-m", "octo: agent prompt", check=False)
+        if result.returncode != 0:
+            assert "nothing to commit" in result.stdout, f"unexpected git commit failure for landing {rels}: {result.stdout}"
+            return []  # every rel already matched HEAD -- nothing to record for this landing
+        sha = self._git("rev-parse", "HEAD").stdout.strip()
+        note_edit = ToolEdit(time.time(), "", session_id, prompt, agent, None)  # file_path unused by _add_note; one note covers the whole commit
+        self._add_note(sha, note_edit, branch)
+        at = float(self._git("log", "-1", "--format=%at", sha).stdout.strip())
+        settled: list[SettledEdit] = []
+        for rel in rels:
+            diff = self._git("show", "--format=", sha, "--", rel).stdout
+            if not diff:
+                continue  # this rel already matched HEAD -- not part of this commit's changes, skip it
+            self.last_commit_for_path[rel] = sha  # fast-path index: every landed file's latest commit is this one
+            settled.append(SettledEdit(str(self.root / rel), diff, at, sha))
+        return settled
 
     def attribute(self, edit: ToolEdit) -> SettledEdit | None:
         """Reattributes the write-watcher commit behind edit to its agent/session/prompt, via a git note.
@@ -386,6 +436,46 @@ class ShadowGitWatcher:
                 diff = self._git("show", "--format=", sha, "--", path).stdout
                 entries.append(HistoryEntry(str(self.root / path), diff, float(at), sha, agent, session_id, prompt, is_baseline, branch))
                 self.last_commit_for_path[path] = sha
+        return entries
+
+    def graph_commits(self, until: str | None = None) -> list[GraphCommit]:
+        """Reads the full commit log oldest-first as one GraphCommit per commit -- the commit-graph
+        screen's live data source. Mirrors history()'s log parse but replaces the per-file `git show`
+        diff loop with a `--name-only` count, so it's cheap enough to re-run on a refresh interval.
+        If until is provided, stops before (exclusive) that commit, matching history()'s cutoff so
+        the graph can render this-session-only by passing the baseline sha. Returns [] on a
+        brand-new shadow repo."""
+        if not self.git_dir.is_dir():
+            return []
+        log = self._git("log", "--reverse", "--format=%H%x00%at%x00%B%x03")
+        commits: list[GraphCommit] = []
+        for raw in log.stdout.split("\x03"):
+            raw = raw.strip("\n")
+            if not raw:
+                continue
+            sha, at, message = raw.split("\x00", 2)
+            if sha == until:
+                break  # reached this session's baseline -- everything after is live activity
+            is_baseline = message.startswith(BASELINE_SUBJECT)
+            agent, session_id, prompt, branch = self._attribution_for(sha, message, is_baseline)
+            file_count = sum(1 for p in self._git("show", "--format=", "--name-only", sha).stdout.splitlines() if p)
+            commits.append(GraphCommit(sha, float(at), agent, session_id, prompt, branch, is_baseline, file_count))
+        return commits
+
+    def commit_detail(self, sha: str) -> list[HistoryEntry]:
+        """Reads the per-file diffs for a single commit as HistoryEntries -- the same per-file
+        `git show` loop history() runs across the whole log, scoped to one sha. Called lazily only
+        when a graph node is clicked, to feed the commit-detail screen's collapsible diffs."""
+        assert self.git_dir.is_dir(), "commit_detail() requires an initialized shadow repo"
+        at = float(self._git("log", "-1", "--format=%at", sha).stdout.strip())
+        message = self._git("log", "-1", "--format=%B", sha).stdout
+        is_baseline = message.startswith(BASELINE_SUBJECT)
+        agent, session_id, prompt, branch = self._attribution_for(sha, message, is_baseline)
+        paths = [p for p in self._git("show", "--format=", "--name-only", sha).stdout.splitlines() if p]
+        entries: list[HistoryEntry] = []
+        for path in paths:
+            diff = self._git("show", "--format=", sha, "--", path).stdout
+            entries.append(HistoryEntry(str(self.root / path), diff, at, sha, agent, session_id, prompt, is_baseline, branch))
         return entries
 
     def _attribution_for(self, sha: str, message: str, is_baseline: bool) -> tuple[str, str, str, str]:

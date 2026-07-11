@@ -56,6 +56,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches  # raised by query_one when a FileSection's Contents isn't composed yet
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import (
@@ -617,25 +618,145 @@ class FileChange:
     reverts_commit: str = ""  # if this commit is a revert, the SHA of what it reverted (truncated for display)
 
 
-def _change_summary_markup(change: FileChange, cwd: str) -> str:
-    """Builds a FileChange's Collapsible title: file path (relative to cwd, struck through +
-    '(reverted)' if change.is_reverted) plus added/removed stats on the first line, then a note
-    suffix (revert-of info takes precedence over a tier-2 shell-activity hint) on its own line
-    below, if there is one. Shared by add_change (initial render) and
-    EditWatcherApp._mark_reverted (retroactive re-render once a live commit gets reverted)."""
-    note_suffix = ""
+def _file_section_title(
+    file_path: str, added: int, removed: int, cwd: str, fully_reverted: bool
+) -> str:
+    """Builds a FileSection's collapsed title: the file path (relative to cwd) plus that file's
+    aggregate +added/-removed across every edit to it in the owning group -- shown once per file no
+    matter how many commits touched it. Struck through (with an '(all reverted)' note) only once
+    every edit to the file has been reverted; a single reverted edit among several strikes just its
+    own FileChangeEntry line, not the whole file."""
+    file_display = escape(os.path.relpath(file_path, cwd))
+    stats_display = f"[green]+{added}[/green] [red]-{removed}[/red]"
+    if fully_reverted:
+        return f"[strike]{file_display}[/strike]  {stats_display}  [dim](all reverted)[/dim]"
+    return f"{file_display}  {stats_display}"
+
+
+def _entry_line_markup(change: FileChange) -> str:
+    """Builds one FileChangeEntry's header line -- the dim 'sha  +N -M' row shown inside a file's
+    FileSection above that single edit's diff and Revert button. One line per individual commit, so
+    a file edited repeatedly in a prompt lists each edit separately under the one file row. Struck
+    through when this edit has been reverted; annotated with the reverted-commit sha when it is
+    itself an octo revert; carries any tier-2 shell-activity note otherwise."""
+    stats = f"[green]+{change.added}[/green] [red]-{change.removed}[/red]"
+    sha = change.commit[:8]
     if change.reverts_commit:
-        note_suffix = f"\n  [dim]reverts [bold]{change.reverts_commit}[/bold][/dim]"
-    elif change.note:
-        note_suffix = f"\n{change.note}"
-
-    file_display = escape(os.path.relpath(change.file_path, cwd))
-    stats_display = f"[green]+{change.added}[/green] [red]-{change.removed}[/red]"
+        return f"[dim][bold]{sha}[/bold]  {stats}  reverts [bold]{change.reverts_commit}[/bold][/dim]"
     if change.is_reverted:
-        file_display = f"[strike]{file_display}[/strike]"
-        note_suffix = f"\n  [dim][bold]{change.commit[:8]}[/bold] reverted[/dim]"
+        return f"[dim][strike][bold]{sha}[/bold][/strike]  {stats}  reverted[/dim]"
+    line = f"[dim][bold]{sha}[/bold]  {stats}[/dim]"
+    if change.note:
+        line += f"\n{change.note}"
+    return line
 
-    return f"{file_display}  {stats_display}{note_suffix}"
+
+class FileChangeEntry(Vertical):
+    """One committed edit to a file, rendered as a row inside its file's FileSection: a dim
+    'sha  +N -M' line, a Revert button that reverts just this edit (omitted for the Init baseline
+    group and for already-reverted edits), and the diff (hidden until the section is expanded).
+    Several stack under one FileSection when a file is edited repeatedly in a prompt -- the file
+    shows once, each edit stays independently revertable."""
+
+    def __init__(self, change: FileChange, theme: Theme, revertable: bool):
+        super().__init__()
+        self.change = change  # the single edit this row renders and (if revertable) reverts
+        self._theme = theme  # active theme, for diff syntax highlighting
+        self._revertable = (
+            revertable  # false for Init baseline / already-reverted edits -- no Revert button
+        )
+        self.section: "FileSection | None" = (
+            None  # owning FileSection, set by add_entry; lets _mark_reverted reach the group
+        )
+        self._line_static: Static | None = (
+            None  # the dim header line; re-rendered by mark_reverted when this edit is reverted
+        )
+
+    def compose(self) -> ComposeResult:
+        self._line_static = Static(_entry_line_markup(self.change), markup=True)
+        yield self._line_static
+        if self._revertable and not self.change.is_reverted:
+            yield RevertButton(
+                self.change.file_path,
+                self.change.commit,
+                self.change.added,
+                self.change.removed,
+                is_reverted=False,
+            )
+        body = (
+            _diff_markup(self.change.diff, self.change.file_path, self._theme)
+            if self.change.diff
+            else "[dim](no diff)[/dim]"
+        )
+        yield Static(body, markup=True)
+
+    def mark_reverted(self):
+        """Re-renders this row struck-through and removes its Revert button once this edit has been
+        reverted by a later commit (change.is_reverted is set by the caller first)."""
+        if self._line_static is not None:  # None only before compose() has run
+            self._line_static.update(_entry_line_markup(self.change))
+        for button in self.query(RevertButton):
+            button.remove()
+
+
+class FileSection(Collapsible):
+    """Every edit to one file within a PromptGroup, collapsed to a single row titled by the file
+    path and that file's aggregate +/-; expanding lists each edit (FileChangeEntry) with its own
+    Revert button. Combining a file's repeated edits into one row is what keeps the feed uncluttered
+    while still allowing per-edit revert."""
+
+    def __init__(self, file_path: str, cwd: str, group: "PromptGroup"):
+        super().__init__(
+            collapsed=True, title=_file_section_title(file_path, 0, 0, cwd, False)
+        )
+        self.file_path = file_path  # absolute path every entry under this section edits
+        self._cwd = cwd  # working dir, for the title's relative path
+        self.group = group  # owning PromptGroup, so a reverted entry can reach group.mark_reverted
+        self._entries: list[FileChangeEntry] = []  # every edit to this file, in add order
+        self._added = 0  # aggregate added lines across entries, for the title
+        self._removed = 0  # aggregate removed lines across entries, for the title
+
+    def add_entry(self, entry: FileChangeEntry):
+        """Mounts one more edit's row under this file and updates the aggregate title. Mounts into
+        the already-composed Contents if it exists, else defers to compose() via _contents_list --
+        the same not-yet-composed race PromptGroup handles for its own header (several edits to one
+        file can land in one synchronous replay pass before Contents is ever composed)."""
+        entry.section = self
+        self._entries.append(entry)
+        self._added += entry.change.added
+        self._removed += entry.change.removed
+        try:
+            contents = self.query_one(Collapsible.Contents)
+        except NoMatches:
+            self._contents_list.append(entry)  # not composed yet; compose() picks it up
+        else:
+            contents.mount(entry)
+        self._refresh_title()
+
+    def remove_entry(self, entry: FileChangeEntry) -> bool:
+        """Un-mounts one edit's row (e.g. a Human->agent reattribution moving it to another group)
+        and updates the aggregate title. Returns True if the section is now empty, so the owning
+        PromptGroup can drop it."""
+        self._added -= entry.change.added
+        self._removed -= entry.change.removed
+        self._entries.remove(entry)
+        entry.remove()
+        if self._entries:
+            self._refresh_title()
+        return not self._entries
+
+    def refresh_after_revert(self):
+        """Re-renders the title struck-through once every edit to this file has been reverted."""
+        self._refresh_title()
+
+    def _refresh_title(self):
+        """Rebuilds the collapsed title from the current aggregate stats and all-reverted state."""
+        fully_reverted = bool(self._entries) and all(
+            e.change.is_reverted for e in self._entries
+        )
+        self.title = _file_section_title(
+            self.file_path, self._added, self._removed, self._cwd, fully_reverted
+        )
 
 
 class PromptGroup(Vertical):
@@ -665,6 +786,9 @@ class PromptGroup(Vertical):
         )  # (timestamp, prompt_text) tuples for prompts before this one that didn't cause changes
         self.session_id = session_id  # originating session id if agent-attributed, else ""
         self.branch = branch          # originating worktree branch if agent-attributed, else ""
+        self._file_sections: dict[str, FileSection] = (
+            {}
+        )  # file_path -> its FileSection, so repeated edits to the same file combine into one row
         self._change_count = (
             0  # tracked separately from self.children: Widget.remove() is queued, not
         )
@@ -753,43 +877,32 @@ class PromptGroup(Vertical):
             return f"[italic]{escape(excerpt)}[/italic]"
         return f"[dim]{self.empty_note}[/dim]"
 
-    def add_change(self, change: FileChange) -> Collapsible:
-        """Mounts one more committed file change as a collapsed-by-default section under this group,
-        with a Revert button (see RevertButton) alongside its diff -- omitted for the Init baseline
-        group, since there's no prior state to revert to; omitted for reverted commits. Returns the
-        mounted widget so a later reattribution can move it into a different group."""
-        summary = _change_summary_markup(change, self.app.cwd)
-        body_markup = (
-            _diff_markup(change.diff, change.file_path, self.app.current_theme)
-            if change.diff
-            else "[dim](no diff)[/dim]"
-        )
-        children = [Static(body_markup, markup=True)]
-        # only show revert button for non-reverted, non-init commits
-        if self.agent != INIT_AGENT_LABEL and not change.is_reverted:
-            children.insert(
-                0,
-                RevertButton(
-                    change.file_path,
-                    change.commit,
-                    change.added,
-                    change.removed,
-                    is_reverted=False,
-                ),
-            )
+    def add_change(self, change: FileChange) -> FileChangeEntry:
+        """Mounts one committed edit under this group, combined into its file's FileSection so each
+        file shows once no matter how many commits touched it (see FileSection) -- the edit gets its
+        own Revert button inside that section, omitted for the Init baseline group (no prior state to
+        revert to) and for already-reverted commits. Returns the mounted FileChangeEntry so a later
+        reattribution can move it into a different group."""
+        revertable = self.agent != INIT_AGENT_LABEL and not change.is_reverted
+        section = self._file_sections.get(change.file_path)
+        if section is None:
+            section = FileSection(change.file_path, self.app.cwd, self)
+            self._file_sections[change.file_path] = section
+            self.mount(section)
+        entry = FileChangeEntry(change, self.app.current_theme, revertable)
+        section.add_entry(entry)
+        if revertable:
             self._active_revert_count += 1
             if (
                 self.agent != HUMAN_AGENT_LABEL
             ):  # Human groups never get a group-level revert button (see compose())
                 self._show_revert_button = True
                 self._sync_revert_button()
-        collapsible = Collapsible(*children, title=summary, collapsed=True)
-        self.mount(collapsible)
         self._change_count += 1
         self._added_total += change.added
         self._removed_total += change.removed
         self._refresh_title()
-        return collapsible
+        return entry
 
     def add_external_note(self, file_path: str):
         """Mounts a plain, non-collapsible line noting file_path changed outside the watched tree --
@@ -829,19 +942,23 @@ class PromptGroup(Vertical):
             self._revert_button.remove()
             self._revert_button = None
 
-    def remove_change(self, widget: Collapsible):
-        """Un-mounts one file change previously returned by add_change, e.g. to move it into another group."""
-        revert_button = widget.query_one(
-            RevertButton
-        )  # read its line counts before it's gone, to subtract them below
-        self._added_total -= revert_button.added
-        self._removed_total -= revert_button.removed
-        widget.remove()
+    def remove_change(self, entry: FileChangeEntry):
+        """Un-mounts one edit previously returned by add_change, e.g. to move it into another group;
+        drops its FileSection too if that was the file's only remaining edit. Reads the line counts
+        off the edit's own FileChange (always present, unlike its Revert button, which is absent on
+        reverted edits)."""
+        self._added_total -= entry.change.added
+        self._removed_total -= entry.change.removed
+        section = entry.section
+        assert section is not None, "entry came from add_change, which always sets its section"
+        if section.remove_entry(entry):
+            del self._file_sections[section.file_path]
+            section.remove()
         self._change_count -= 1
         self._refresh_title()
 
     def is_empty(self) -> bool:
-        """True once every file-change Collapsible mounted under this group has been moved out via remove_change."""
+        """True once every edit mounted under this group has been moved out via remove_change."""
         return self._change_count <= 0
 
 
@@ -921,6 +1038,13 @@ class EditWatcherApp(App):
         border: none;
         padding: 0 1;
     }
+    FileChangeEntry {
+        height: auto;
+        margin-bottom: 1;
+    }
+    FileChangeEntry:last-child {
+        margin-bottom: 0;
+    }
     """
     BINDINGS = [
         (
@@ -940,6 +1064,9 @@ class EditWatcherApp(App):
         Binding(
             BRANCHES_KEY, BRANCHES_ACTION, "Branches"
         ),  # opens the running-agent-branches overview screen
+        Binding(
+            "g", "show_graph", "Graph"
+        ),  # opens the GitKraken-style commit graph screen (see commit_graph_screen.py)
     ]
 
     def __init__(self, root: Path, cwd: str, agent: str):
@@ -979,8 +1106,8 @@ class EditWatcherApp(App):
         )
         self._current_octo_key: object = None  # identity of the original PromptGroup _current_octo_group is reverting (see _octo_group_for)
         self._commit_widgets: dict[
-            str, tuple[Collapsible, FileChange]
-        ] = {}  # full commit sha -> its mounted Collapsible + FileChange, for retroactively marking a commit reverted once a later commit (rendered this session) reverts it
+            str, tuple[FileChangeEntry, FileChange]
+        ] = {}  # full commit sha -> its mounted FileChangeEntry + FileChange, for retroactively marking a commit reverted once a later commit (rendered this session) reverts it
         self._history_anchor: EditBlock | None = (
             None  # fixed insertion point — history blocks mount immediately before this
         )
@@ -1261,29 +1388,23 @@ class EditWatcherApp(App):
         state.detail = down_result.detail
 
     def _land_up_synced_edits(self, state: WorktreeSyncState, changed_paths: list[str]):
-        """Commits up_sync's file-apply result via the normal commit_dirty() pipeline (shared
-        with poll_once via _process_commit_dirty, so a human edit that happened to settle in the
-        same tick still renders correctly as a Human flush, not swallowed here), then tags just
-        the paths this up-sync actually landed with the worktree's agent/session/prompt -- via
-        attribute_settled -- and renders each through the existing _render_agent_edit path, same
-        as any other attributed agent edit."""
+        """Records up_sync's file-apply result as a SINGLE attributed shadow commit covering every
+        path this up-sync landed (commit_landing), so one agent prompt is one commit-graph row
+        instead of one row per file. Renders each landed file through the existing _render_agent_edit
+        path off that shared sha, same as any other attributed agent edit. Any unrelated human write
+        that settled in the same tick is intentionally left dirty here -- the next poll_once tick's
+        commit_dirty() picks it up as an ordinary Human flush, keeping this commit purely the agent's
+        prompt."""
         assert self._repo_root is not None, (
             "a worktree registration always resolves _repo_root before any turn-boundary signal can arrive"
         )
-        # changed_paths are relative to the real git repo root (self._repo_root), which may differ
-        # from self.root if octo is watching a subdirectory of the repo -- resolve against
-        # _repo_root, not self.root, to match SettledEdit.file_path correctly either way.
-        changed_abs = {str(self._repo_root / rel) for rel in changed_paths}
-        settled_list = self.file_watcher.commit_dirty()
         prompt = (
             read_last_prompt(state.transcript_path) if state.transcript_path else ""
         )
+        settled_list = self.file_watcher.commit_landing(
+            changed_paths, state.agent, state.session_id, prompt, branch=state.branch
+        )
         for settled in settled_list:
-            if settled.file_path not in changed_abs:
-                continue  # not one of this up-sync's own files -- an unrelated human write settling in the same tick; _process_commit_dirty renders it as Human below
-            self.file_watcher.attribute_settled(
-                settled, state.agent, state.session_id, prompt, branch=state.branch
-            )
             self._render_agent_edit(
                 settled,
                 ToolEdit(
@@ -1296,9 +1417,6 @@ class EditWatcherApp(App):
                 ),
                 branch=state.branch,
             )
-        self._process_commit_dirty(
-            [s for s in settled_list if s.file_path not in changed_abs]
-        )
 
     def on_button_pressed(self, event: Button.Pressed):
         """Handles a RevertButton (one file) or PromptRevertButton (every file in a group) press
@@ -1451,7 +1569,9 @@ class EditWatcherApp(App):
         Returns (group_to_use, new_current_group, new_current_key) for the caller to carry
         forward into whichever trailing-state it's tracking."""
         original = self._commit_widgets.get(reverted_sha)
-        original_group = original[0].parent if original is not None else None
+        original_group = (
+            original[0].section.group if original is not None else None
+        )  # entry -> its FileSection -> owning PromptGroup (entry.parent is the section's Contents, not the group)
         key = (
             original_group if original_group is not None else reverted_sha
         )  # sha fallback: never seen this original -- always a fresh block
@@ -1467,10 +1587,11 @@ class EditWatcherApp(App):
         return group, group, key
 
     def _mark_reverted(self, sha: str):
-        """Retroactively updates a commit's already-mounted widget (tracked in _commit_widgets) to
-        reflect that it's now reverted: crosses out its file path and removes its Revert button, then
-        tells the owning PromptGroup (see PromptGroup.mark_reverted) so it can hide its own
-        PromptRevertButton once every change it holds has been reverted this way.
+        """Retroactively updates a commit's already-mounted FileChangeEntry (tracked in
+        _commit_widgets) to reflect that it's now reverted: strikes through that one edit's row and
+        removes its Revert button, restrikes the whole file's FileSection title if every edit to it
+        is now reverted, then tells the owning PromptGroup (see PromptGroup.mark_reverted) so it can
+        hide its own PromptRevertButton once every change it holds has been reverted this way.
         No-op if sha was never rendered this session (e.g. reverted in a prior run -- _render_history
         already renders it correctly reverted from git notes) or is already marked, keeping repeat
         calls (e.g. re-reverting back and forth) safe."""
@@ -1481,14 +1602,11 @@ class EditWatcherApp(App):
         if change.is_reverted:
             return  # already marked -- nothing new to reflect
         change.is_reverted = True
-        widget.title = _change_summary_markup(change, self.cwd)
-        for button in widget.query(RevertButton):
-            button.remove()
-        group = (
-            widget.parent
-        )  # PromptGroup this change's Collapsible was mounted into, per add_change
-        assert isinstance(group, PromptGroup)
-        group.mark_reverted()
+        widget.mark_reverted()  # strike this edit's row, drop its Revert button
+        section = widget.section
+        assert section is not None, "a rendered entry always has its section set by add_entry"
+        section.refresh_after_revert()  # restrike the file title if every edit to it is now reverted
+        section.group.mark_reverted()  # let the group hide its prompt-level revert button once done
 
     def _open_agent_group(
         self, timestamp: float, agent: str, prompt: str, key: tuple[str, str], branch: str = ""
@@ -1764,6 +1882,13 @@ class EditWatcherApp(App):
     def action_show_branches(self):
         """Bound to BRANCHES_KEY; opens the running-agent-branches overview screen."""
         self.push_screen(BranchesScreen(self.root))
+
+    def action_show_graph(self):
+        """Bound to 'g'; opens the commit-graph screen. Imported lazily to break the import cycle
+        (commit_graph_screen imports this module's helpers at load time)."""
+        from commit_graph_screen import CommitGraphScreen
+
+        self.push_screen(CommitGraphScreen(self.file_watcher, self._baseline_sha))
 
     def _find_editor(self) -> str | None:
         """Returns the first available editor from (nvim, emacs, vim, vi, nano), or None if none found."""
