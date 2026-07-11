@@ -3,13 +3,18 @@
 carries no real gating logic yet -- always approves, so it can never block a genuine write.
 Stop is the turn-boundary signal the sync sequence hooks into: it notifies the octo process
 watching this project (worktree-lane via read_owner_marker, root-lane via find_matching_session),
-then always exits 0 too -- it is a pure observer, never blocking/re-prompting the agent (that's
-the doc's separately-scoped, not-yet-implemented conflict-delegation path)."""
+and also fires a "turn complete" desktop notification. Notification is Claude's "needs the user"
+event (permission prompts / idle) -- it fires a "needs permission" desktop notification. Every
+event still always exits 0 -- this is a pure observer, never blocking/re-prompting the agent
+(that's the doc's separately-scoped, not-yet-implemented conflict-delegation path). Desktop
+notifications only fire when an octo session is actually watching this project, so nothing pops
+after octo is closed."""
 
 import json
 import sys
 from pathlib import Path
 
+from notifications import AgentState, classify_claude_notification, notify_agent_state
 from session_registry import find_matching_session, notify_turn_ended, notify_sync
 from worktree_manager import read_owner_marker
 
@@ -26,6 +31,9 @@ def main():
         sys.exit(0)
     elif event_name == "UserPromptSubmit":
         _handle_prompt_submit(payload)
+        sys.exit(0)
+    elif event_name == "Notification":
+        _handle_notification(payload)
         sys.exit(0)
     sys.exit(0)  # always approve/allow for other events like PreToolUse
 
@@ -63,7 +71,8 @@ def _handle_prompt_submit(payload: dict):
 
 def _signal_turn_end(payload: dict):
     """Resolves which live octo process to notify: worktree-lane via the clone's owner marker,
-    root-lane via find_matching_session (agent running directly in the watched project).
+    root-lane via find_matching_session (agent running directly in the watched project). Drops the
+    TurnEnded sync signal into that process's inbox and fires a turn-complete desktop notification.
     No-op if neither path resolves -- the hook fired in a session octo isn't tracking."""
     cwd = Path(payload["cwd"])
     session_id = payload.get("session_id", "")
@@ -74,6 +83,7 @@ def _signal_turn_end(payload: dict):
     owner = read_owner_marker(cwd)
     if owner is not None:
         notify_turn_ended(owner["pid"], cwd, session_id, transcript_path, agent_name)
+        notify_agent_state(agent_name, AgentState.TURN_COMPLETE, _project_label(payload))
         return
 
     # Path 2: root lane -- agent running directly in the watched project
@@ -81,6 +91,33 @@ def _signal_turn_end(payload: dict):
     if session is not None:
         # worktree_path = Path("") signals "this is root-lane, not a worktree"
         notify_turn_ended(session.pid, Path(""), session_id, transcript_path, agent_name)
+        notify_agent_state(agent_name, AgentState.TURN_COMPLETE, _project_label(payload))
+
+
+def _handle_notification(payload: dict):
+    """Fires a desktop notification for Claude's Notification hook (permission prompt / idle),
+    but only when an octo session is actually watching this project (worktree-lane owner marker or
+    root-lane find_matching_session) -- so nothing pops after octo is closed. The message text is
+    classified into an AgentState; idle classifies to WAITING_INPUT, which notify_agent_state drops,
+    leaving only permission prompts to pop."""
+    cwd = Path(payload["cwd"])
+    if not _octo_is_watching(cwd):
+        return
+    state = classify_claude_notification(payload.get("message", ""))
+    notify_agent_state(DEFAULT_AGENT, state, _project_label(payload))
+
+
+def _octo_is_watching(cwd: Path) -> bool:
+    """True if a live octo process owns cwd -- either as a registered worktree clone (owner marker)
+    or as the watched root/an ancestor of it (find_matching_session). Gates desktop notifications so
+    a hook firing in a project octo isn't tracking stays silent."""
+    return read_owner_marker(cwd) is not None or find_matching_session(cwd) is not None
+
+
+def _project_label(payload: dict) -> str:
+    """Short "which project" string for a notification body -- the cwd basename -- so a user running
+    several agents at once can tell the popups apart."""
+    return Path(payload["cwd"]).name
 
 
 if __name__ == "__main__":

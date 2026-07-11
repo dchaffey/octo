@@ -106,10 +106,12 @@ def _install_hook_for_agent(agent_name: str, project_root: Path, relative_config
 
 def install_claude_hook(project_root: Path, hook_marker: str, hook_command: str) -> HookInstallResult:
     """Installs octo's PreToolUse hook (placeholder, always approves), its Stop hook (turn-
-    boundary signal for worktree_sync.py -- see octo_hook.py), and its UserPromptSubmit hook
-    (prompt start boundary) into <project_root>/.claude/settings.json, in one read-merge-merge-merge-write
-    pass so all entries land in a single write. Schema confirmed against a live ~/.claude/settings.json
-    on this machine (PreToolUse) and against live docs (Stop, UserPromptSubmit -- see _merge_hook_entry)."""
+    boundary signal for worktree_sync.py + a turn-complete desktop notification -- see octo_hook.py),
+    its UserPromptSubmit hook (prompt start boundary), and its Notification hook (Claude's
+    "needs the user" signal -- permission prompts / idle, drives desktop notifications) into
+    <project_root>/.claude/settings.json, in one read-merge-*-write pass so all entries land in a
+    single write. Schema confirmed against a live ~/.claude/settings.json on this machine
+    (PreToolUse) and against live docs (Stop, UserPromptSubmit, Notification -- see _merge_hook_entry)."""
     assert project_root.is_dir(), "Claude hook install requires an existing project directory"
     config_path = project_root / ".claude" / "settings.json"
     config = _read_json_config(config_path)
@@ -117,9 +119,11 @@ def install_claude_hook(project_root: Path, hook_marker: str, hook_command: str)
     config, pre_already = _merge_hook_entry(config, "PreToolUse", matcher, hook_marker, hook_command)
     config, stop_already = _merge_hook_entry(config, "Stop", None, hook_marker, hook_command)
     config, submit_already = _merge_hook_entry(config, "UserPromptSubmit", None, hook_marker, hook_command)
-    if not (pre_already and stop_already and submit_already):
+    config, notif_already = _merge_hook_entry(config, "Notification", None, hook_marker, hook_command)  # None: Notification, like Stop, has no matcher support
+    all_present = pre_already and stop_already and submit_already and notif_already
+    if not all_present:
         _write_json_config(config_path, config)
-    return HookInstallResult("Claude", True, config_path, pre_already and stop_already and submit_already)
+    return HookInstallResult("Claude", True, config_path, all_present)
 
 
 def install_codex_hook(project_root: Path, hook_marker: str, hook_command: str) -> HookInstallResult:

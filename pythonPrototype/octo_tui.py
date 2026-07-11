@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_detection import AGENT_BINARIES
-from agent_watcher import ShellMoveEdit, ToolEdit, read_last_prompt
+from agent_watcher import ShellMoveEdit, ToolEdit, build_tailers, read_last_prompt
 from hook_installer import detect_and_install_hooks
 from pygments import (
     lex,  # tokenizes one diff line's code content for syntax highlighting
@@ -947,6 +947,7 @@ class EditWatcherApp(App):
         self.root = root  # directory whose files are watched for changes
         self.cwd = cwd  # agent cwd whose sessions to tail
         self.agent_filter = agent  # which agent(s) to correlate against ('both' = all)
+        self.tailers: list = []  # per-agent transcript tailers, built on mount; polled each tick to relabel Human commits to their agent
         self.pid = os.getpid()  # this process's pid -- matches what register() advertised, so drain_pending_worktrees reads our own inbox
         self.file_watcher = ShadowGitWatcher(
             root
@@ -1023,22 +1024,66 @@ class EditWatcherApp(App):
         )  # render baseline and capture its block as insertion point
         self._update_history_binding()
         self._update_clear_cache_binding()
-        # Install hooks into the root project's agent configs (idempotent).
-        # Agents with hooks installed become hook-driven — tailers skip attribute() for them.
+        # Install hooks into the root project's agent configs (idempotent). Hooks drive worktree-lane
+        # attribution (via octo run) and desktop notifications; root-lane edits (a claude/codex run
+        # directly in the watched tree) are attributed by the transcript tailers below instead.
         results = detect_and_install_hooks(self.root)
+        self.tailers = build_tailers(self.cwd, self.agent_filter)  # content-match agent tool calls against Human commits each tick
         self.set_interval(POLL_INTERVAL_SECONDS, self.poll_once)
 
     def poll_once(self):
-        """One drain pass: processes turn-boundary signals (worktree + root-lane),
-        sync events, then commits whatever's still dirty on disk."""
+        """One drain pass: processes turn-boundary signals (worktree + root-lane), sync events,
+        reattributes root-lane agent edits their transcripts now explain, then commits whatever's
+        still dirty on disk."""
         for registration in drain_pending_worktrees(self.pid):
             self._render_worktree_registration(registration)
         for turn_ended in drain_pending_turn_ends(self.pid):
             self._handle_turn_ended(turn_ended)
         for sync in drain_pending_syncs(self.pid):
             self._handle_sync_event(sync)
+        self._drain_tailers()  # relabel Human commits an agent transcript now explains, before they'd flush as Human
         with self._root_lane:
             self._process_commit_dirty(self.file_watcher.commit_dirty())
+
+    def _drain_tailers(self):
+        """Reattributes agent edits/moves that new transcript lines now explain: for each tailer,
+        reads its new findings (dropping pre-start history), then relabels the matching shadow
+        commit from "Human" to the agent via attribute()/attribute_move(), rendering each in place.
+        Runs before commit_dirty() each tick so a write the transcript already explains is annotated
+        before it would otherwise flush as an unattributed Human edit (see commit_dirty's docstring).
+        This is the sole attribution path for a claude/codex run directly in the watched tree
+        (root lane) -- the worktree lane attributes via the up-sync hooks instead."""
+        for tailer in self.tailers:
+            result = tailer.poll().filter_since(tailer.start_time)  # drop history a freshly started tailer shouldn't act on
+            for edit in result.edits:
+                self._attribute_tailer_edit(edit)
+            for move in result.moves:
+                self._attribute_tailer_move(move)
+
+    def _attribute_tailer_edit(self, edit: ToolEdit):
+        """Relabels the shadow commit matching one transcript Edit/Write to its agent, rendering it
+        in place. Skips edits whose content isn't recoverable from the log, or whose path is outside
+        the watched tree (the shadow repo has no baseline there, so attribute() can't address it)."""
+        if edit.content is None:
+            return  # content not recoverable from the log; no fs fallback, so this edit is unreportable
+        if not self._is_within_root(edit.file_path):
+            return  # outside the watched tree -- nothing in the shadow repo to attribute
+        settled = self.file_watcher.attribute(edit)
+        if settled is not None:  # None when no committed content matches (yet) -- next tick's commit_dirty picks it up as Human
+            self._render_agent_edit(settled, edit)
+
+    def _attribute_tailer_move(self, move: ShellMoveEdit):
+        """Relabels the shadow commit(s) behind one transcript mv/cp to its agent. Skips moves
+        touching a path outside the watched tree, for the same baseline reason as _attribute_tailer_edit."""
+        if not (self._is_within_root(move.src_path) and self._is_within_root(move.dst_path)):
+            return  # a side outside the watched tree -- shadow repo can't address it
+        for settled in self.file_watcher.attribute_move(move):
+            self._render_agent_edit(settled, move)
+
+    def _is_within_root(self, file_path: str) -> bool:
+        """True if file_path lives inside self.root -- the shadow repo has no baseline outside it,
+        so attribute()/attribute_move() (which relative_to() the path) can't be called otherwise."""
+        return Path(file_path).is_relative_to(self.root)
 
     def _process_commit_dirty(self, settled_list: list[SettledEdit]):
         """Renders one commit_dirty() batch: octo-generated revert commits (see
