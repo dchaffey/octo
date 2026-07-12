@@ -40,6 +40,63 @@ flowchart LR
 Because everything lands in a real git repo, revert is just `git revert`/checkout against `.octo`,
 and history is just `git log` — octo's own code only has to watch, correlate, and render.
 
+### Agent worktrees & the sync loop
+
+`octo run <agent>` (below) never lets an agent touch root's real files directly. Instead it clones
+root's shadow repo (`.octo`, not the real project `.git` — the shadow repo's HEAD is always a
+fresh, git-committed snapshot of what's actually on disk, while the real repo's last commit is only
+whatever the human last committed by hand) into a throwaway worktree under `~/.octo/worktrees/`,
+on its own branch, and runs the agent CLI there. Two sync functions keep that worktree honest
+against root as the agent works:
+
+- **`down_sync`** — before every prompt (`UserPromptSubmit` hook), rebase the worktree onto
+  root's shadow HEAD, root winning any textual collision (`-X ours`). Keeps the agent working
+  against fresh root state without clobbering its own in-progress edits.
+- **`up_sync`** — after every turn (`Stop` hook queues a signal; octo's poll loop drains it), commit
+  whatever the agent left dirty, trial-merge the worktree's branch against root's shadow HEAD in a
+  disposable scratch clone, and — only if that merge is clean — copy just the changed files' bytes
+  onto root's *real* working tree. A conflict aborts the merge, leaves root's files untouched, and
+  pauses the worktree instead of guessing.
+
+Landing those bytes on root's working tree is deliberately just a file write, not a direct commit:
+the existing `commit_dirty()` pipeline picks them up on its next tick like any other edit and
+attributes them to the worktree's agent, so up-synced work shows up in the live feed exactly like a
+normal attributed edit. `commit_dirty()`'s own poll-tick flush and up-sync's file-apply step both
+mutate root's shadow HEAD/working tree, so a `RootLane` mutex serializes the two instead of letting
+them race.
+
+```mermaid
+flowchart TB
+    subgraph Root["Root process — watches the real project"]
+        direction TB
+        WORK["Working tree<br/>(root's real files on disk)"]
+        DIRTY["commit_dirty()<br/>commits every settled write<br/>as 'Human', instantly"]
+        SHADOW[(".octo shadow repo<br/>HEAD = latest snapshot")]
+        WORK -- "file changed" --> DIRTY --> SHADOW
+    end
+
+    SHADOW ==>|"git clone<br/>(octo run &lt;agent&gt;)"| CLONE
+
+    subgraph Worktree["Agent worktree — one throwaway clone per invocation"]
+        direction TB
+        CLONE["Clone on a new branch<br/>~/.octo/worktrees/&lt;repo&gt;/&lt;agent&gt;-&lt;tag&gt;"]
+        AGENT["Agent CLI edits files<br/>(Claude / Codex / Antigravity)"]
+        CLONE --> AGENT --> CLONE
+    end
+
+    DOWN["down_sync()<br/>— before every prompt —<br/>rebase worktree onto shadow HEAD,<br/>root wins conflicts (-X ours)"]
+    SHADOW -->|rebase target| DOWN
+    DOWN -->|rebased branch| CLONE
+
+    UP["up_sync()<br/>— after every turn —<br/>commit worktree's dirty files,<br/>trial 3-way merge in a scratch clone,<br/>if clean copy changed file bytes"]
+    CLONE -->|new commits| UP
+    SHADOW -->|merge base| UP
+    UP -->|"apply changed files<br/>(inside RootLane mutex)"| WORK
+    UP -.->|conflict| PAUSE["worktree paused;<br/>WORK left untouched"]
+
+    DIRTY -->|"next tick: attribute the<br/>landed commit to the agent<br/>(git-notes)"| SHADOW
+```
+
 ### Entry point
 
 [`pythonPrototype/octo.py`](pythonPrototype/octo.py) is the entry point:
