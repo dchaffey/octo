@@ -14,11 +14,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent_detection import AGENT_BINARIES, resolve_single_agent
 from hook_installer import detect_and_install_hooks
-from session_registry import find_matching_session, register_worktree
+from session_registry import find_matching_session, register_worktree, RunningSession
 from worktree_manager import WorktreeHandle, create_agent_worktree, write_owner_marker
 
 
@@ -47,37 +50,76 @@ def run(identifier: str, passthrough: list[str]):
         print(f"octo run: {agent}'s CLI ({AGENT_BINARIES[agent]}) was not found on PATH.", file=sys.stderr)
         sys.exit(1)
 
-    cwd = Path.cwd()
+    cwd = Path.cwd().resolve()
     session = find_matching_session(cwd)
     if session is None:
         print(f"octo run: no running octo session is watching {cwd} (or a related directory). "
               f"Start one first, e.g.: octo {cwd}", file=sys.stderr)
         sys.exit(1)
 
-    handle = _redirect_into_worktree(session, agent)
-    sys.exit(_run_agent_and_cleanup(str(binary_path), passthrough, handle))
+    # Automatically scope the worktree to the subdirectory if invoked from one
+    subpath = None
+    try:
+        rel = cwd.relative_to(Path(session.root).resolve())
+        if str(rel) != "." and str(rel) != "":
+            subpath = str(rel)
+    except ValueError:
+        pass
+
+    handle = _redirect_into_worktree(session, agent, subpath=subpath)
+    sys.exit(_run_agent_and_cleanup(str(binary_path), passthrough, handle, owner_pid=session.pid))
 
 
-def _redirect_into_worktree(session, agent: str) -> WorktreeHandle:
+def _redirect_into_worktree(session, agent: str, subpath: str | None = None) -> WorktreeHandle:
     """Creates this invocation's clone, tags it with the watching octo process's pid/root (so a
     Stop hook firing inside it later can find its way back -- see octo_hook.py), installs octo's
     hook config into it (fresh, not copied -- .claude/ etc. are gitignored, so nothing to inherit
     from the clone), and registers it with the watching octo process."""
-    handle = create_agent_worktree(session.root, agent)  # cloned from session.root's shadow repo, not the real project .git
+    handle = create_agent_worktree(session.root, agent, subpath=subpath)  # cloned from session.root's shadow repo, not the real project .git
                                                           # (see worktree_manager module docstring) -- `agent` is the display
                                                           # name (e.g. "Claude"), which becomes the on-disk branch/dir naming
     write_owner_marker(handle.path, session.pid, session.root)
-    detect_and_install_hooks(handle.path)
+    detect_and_install_hooks(handle.agent_cwd)
     register_worktree(session, handle.path, handle.branch, agent)  # hands the new worktree off to the watching octo process's next poll tick
     return handle
 
 
-def _run_agent_and_cleanup(binary_path: str, passthrough: list[str], handle: WorktreeHandle) -> int:
-    """Spawns the real agent binary as a child process with handle.path as its cwd (inheriting our
+def _monitor_parent(parent_pid: int, child: subprocess.Popen):
+    """Periodically checks if the parent (watching octo) process is still alive.
+    If it terminates, terminates the child agent process as well."""
+    while child.poll() is None:
+        try:
+            os.kill(parent_pid, 0)
+        except ProcessLookupError:
+            # Parent is dead! Terminate the child.
+            child.terminate()
+            # Wait up to 3 seconds for it to exit, then kill if still running
+            for _ in range(30):
+                if child.poll() is not None:
+                    break
+                time.sleep(0.1)
+            else:
+                try:
+                    child.kill()
+                except ProcessLookupError:
+                    pass
+            break
+        except PermissionError:
+            pass
+        time.sleep(1.0)
+
+
+def _run_agent_and_cleanup(binary_path: str, passthrough: list[str], handle: WorktreeHandle, owner_pid: int) -> int:
+    """Spawns the real agent binary as a child process with handle.agent_cwd as its cwd (inheriting our
     stdio directly, so the terminal session is fully interactive), waits for it to exit for any
     reason, then always removes handle.path -- see module docstring for why this replaces the old
     SessionEnd-hook-based cleanup."""
-    child = subprocess.Popen([binary_path, *passthrough], cwd=handle.path, env=_exec_env())
+    child = subprocess.Popen([binary_path, *passthrough], cwd=handle.agent_cwd, env=_exec_env())
+
+    # Spawn background thread to monitor the parent octo process liveness
+    monitor_thread = threading.Thread(target=_monitor_parent, args=(owner_pid, child), daemon=True)
+    monitor_thread.start()
+
     forward_sigterm = lambda signum, frame: child.terminate()  # `kill <this pid>` (unlike Ctrl+C) targets only us, not the child, so it needs explicit forwarding
     previous_handler = signal.signal(signal.SIGTERM, forward_sigterm)
     try:
@@ -115,6 +157,83 @@ def _exec_env() -> dict[str, str]:
     else:
         env.pop("LD_LIBRARY_PATH", None)
     return env
+
+
+@dataclass
+class AgentSession:
+    handle: WorktreeHandle
+    session_name: str
+
+
+def _ensure_tmux_config() -> Path:
+    config_dir = Path.home() / ".octo"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "octo.tmux.conf"
+    config_content = (
+        "set-option -g prefix C-o\n"
+        "unbind-key C-b\n"
+        "bind-key C-o send-prefix\n"
+        "bind-key q detach-client\n"
+        "set-option -g status on\n"
+        "set-option -g status-style 'bg=default,fg=yellow'\n"
+        "set-option -g status-left '[Press Ctrl+o q to detach]'\n"
+        "set-option -g status-left-length 40\n"
+        "set-option -g status-right ''\n"
+        "set-window-option -g window-status-current-format ''\n"
+        "set-window-option -g window-status-format ''\n"
+    )
+    if not config_path.exists() or config_path.read_text(encoding="utf-8") != config_content:
+        config_path.write_text(config_content, encoding="utf-8")
+    return config_path
+
+
+def list_live_tmux_sessions() -> set[str]:
+    """Returns a set of active tmux session names on octo's dedicated server."""
+    if not shutil.which("tmux"):
+        return set()
+    try:
+        result = subprocess.run(
+            ["tmux", "-L", "octo", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def launch_agent_session(root: Path, agent: str, subpath: str | None = None) -> AgentSession:
+    """Launches a new agent worktree session detached inside a tmux session on octo's dedicated server."""
+    if not shutil.which("tmux"):
+        raise RuntimeError("tmux is not installed or not found on PATH. Background sessions require tmux.")
+    
+    agent_name, binary_path = resolve_single_agent(agent)
+    if agent_name is None:
+        raise ValueError(f"Unknown agent: {agent}")
+    if binary_path is None:
+        raise RuntimeError(f"Agent binary {agent_name} not found on PATH.")
+
+    session = RunningSession(root=root, pid=os.getpid())
+    handle = _redirect_into_worktree(session, agent_name, subpath=subpath)
+    
+    # tmux session names cannot contain . or :
+    safe_agent = agent_name.replace(".", "-").replace(":", "-")
+    safe_tag = handle.tag.replace(".", "-").replace(":", "-")
+    session_name = f"octo-{safe_agent}-{safe_tag}"
+    
+    tmux_config = _ensure_tmux_config()
+    env = _exec_env()
+    
+    # Spawn detached tmux session
+    cmd = [
+        "tmux", "-L", "octo", "-f", str(tmux_config),
+        "new-session", "-d", "-s", session_name, "-c", str(handle.agent_cwd),
+        "--", str(binary_path)
+    ]
+    subprocess.run(cmd, env=env, check=True)
+    
+    return AgentSession(handle, session_name)
 
 
 if __name__ == "__main__":

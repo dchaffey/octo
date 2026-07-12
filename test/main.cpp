@@ -1,35 +1,19 @@
 #include <iostream>
-#include "animals.h"
+#include "horse.h"
 
 int main() {
-    Dog dog("Buddy", 3);
-    Cat cat("Whiskers", 2);
-    Horse horse("Thunder", 5);
-    Cow cow("Bessie", 4);
-    Chicken chicken("Cluckers", 1);
+    Horse stallion("Thunder", 5, 60);
 
-    dog.greet();
-    dog.bark();
+    std::cout << "Horse: " << stallion.get_name() << std::endl;
+    std::cout << "Age: " << stallion.get_age() << " years" << std::endl;
+    std::cout << "Speed: " << stallion.get_speed() << " km/h" << std::endl;
+    std::cout << "Energy: " << stallion.get_energy() << "/100" << std::endl;
 
-    std::cout << std::endl;
+    stallion.run(10);
+    std::cout << "After 10 min run - Energy: " << stallion.get_energy() << "/100" << std::endl;
 
-    cat.greet();
-    cat.meow();
-
-    std::cout << std::endl;
-
-    horse.greet();
-    horse.neigh();
-
-    std::cout << std::endl;
-
-    cow.greet();
-    cow.moo();
-
-    std::cout << std::endl;
-
-    chicken.greet();
-    chicken.cluck();
+    stallion.eat();
+    std::cout << "After eating - Energy: " << stallion.get_energy() << "/100" << std::endl;
 
     return 0;
 }

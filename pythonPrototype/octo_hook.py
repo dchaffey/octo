@@ -53,12 +53,13 @@ def _handle_prompt_submit(payload: dict):
     from worktree_sync import down_sync
 
     shadow_git_dir = Path(owner["root"]) / SHADOW_DIR_NAME
+    clone_root = owner["clone_root"]
 
-    # Perform the down-sync synchronously
-    result = down_sync(cwd, shadow_git_dir)
+    # Perform the down-sync synchronously using the clone root
+    result = down_sync(clone_root, shadow_git_dir)
 
-    # Notify the TUI of the sync event
-    notify_sync(owner["pid"], cwd, DEFAULT_AGENT, result.ok, result.conflicted, result.detail)
+    # Notify the TUI of the sync event using the clone root
+    notify_sync(owner["pid"], clone_root, DEFAULT_AGENT, result.ok, result.conflicted, result.detail)
 
     if not result.ok:
         # Block Claude from proceeding
@@ -82,7 +83,8 @@ def _signal_turn_end(payload: dict):
     # Path 1: worktree lane (existing) -- clone carries an owner marker
     owner = read_owner_marker(cwd)
     if owner is not None:
-        notify_turn_ended(owner["pid"], cwd, session_id, transcript_path, agent_name)
+        clone_root = owner["clone_root"]
+        notify_turn_ended(owner["pid"], clone_root, session_id, transcript_path, agent_name)
         notify_agent_state(agent_name, AgentState.TURN_COMPLETE, _project_label(payload))
         return
 

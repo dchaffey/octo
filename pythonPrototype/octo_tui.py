@@ -65,6 +65,8 @@ from textual.widgets import (
     DirectoryTree,
     Footer,
     Header,
+    ListView,
+    ListItem,
     LoadingIndicator,
     Static,
     Tree,
@@ -112,12 +114,7 @@ BRANCHES_ACTION = "show_branches"  # action name the BRANCHES_KEY binding dispat
 BRANCHES_REFRESH_SECONDS = (
     1.0  # how often BranchesScreen re-queries `git worktree list` while open
 )
-RETRY_SYNC_KEY = (
-    "r"  # BranchesScreen keybinding that re-dispatches sync for every paused worktree
-)
-RETRY_SYNC_ACTION = (
-    "retry_paused"  # action name the RETRY_SYNC_KEY binding dispatches to
-)
+
 _AGENT_DISPLAY_NAMES = {
     binary: agent for agent, binary in AGENT_BINARIES.items()
 }  # CLI binary name -> display name, inverse of AGENT_BINARIES, for labeling a worktree's branch by its creating agent
@@ -513,7 +510,7 @@ class WorktreeSyncState:
         if self.status == "syncing":
             return "  [dim](syncing...)[/dim]"
         if self.status == "paused":
-            return f"  [dim](paused: {escape(self.detail)} -- press 'r' to retry)[/dim]"
+            return f"  [dim](paused: {escape(self.detail)})[/dim]"
         return ""
 
 
@@ -535,7 +532,211 @@ def _worktree_line(
     )
 
 
-class BranchesScreen(Screen[None]):
+def discover_tui_sessions(repo_root: Path) -> dict[Path, str]:
+    from agent_launcher import list_live_tmux_sessions
+    tui_sessions = {}
+    live_sessions = list_live_tmux_sessions()
+    if not live_sessions:
+        return tui_sessions
+    
+    # Get all agent clones for this repo
+    worktrees = list_agent_worktrees(repo_root)
+    for info in worktrees:
+        if info.is_main:
+            continue
+        parts = info.path.name.rsplit("-", 1)
+        if len(parts) == 2:
+            agent_name, tag = parts
+            safe_agent = agent_name.replace(".", "-").replace(":", "-")
+            session_name = f"octo-{safe_agent}-{tag}"
+            if session_name in live_sessions:
+                tui_sessions[info.path] = session_name
+    return tui_sessions
+
+
+class WorktreeItem(ListItem):
+    def __init__(self, info: WorktreeInfo, sync_state: WorktreeSyncState | None, theme: Theme, session_name: str | None):
+        super().__init__()
+        self.worktree_info = info
+        self.sync_state = sync_state
+        self.theme = theme
+        self.session_name = session_name
+
+    def compose(self) -> ComposeResult:
+        text_widget = Static(_worktree_line(self.worktree_info, self.theme, self.sync_state), markup=True, classes="worktree-text")
+        if not self.worktree_info.is_main and self.session_name:
+            with Horizontal():
+                yield text_widget
+                yield Button("Attach", id="btn-attach", variant="primary")
+        else:
+            yield text_widget
+
+    def update_state(self, info: WorktreeInfo, sync_state: WorktreeSyncState | None, theme: Theme, session_name: str | None) -> bool:
+        """Updates the item's internal state. If the widget structure needs to change (e.g.
+        attaching button presence), returns True to signal that the item should be replaced.
+        Otherwise, updates the text static widget in-place and returns False."""
+        structure_changed = (
+            not self.worktree_info.is_main
+            and bool(self.session_name) != bool(session_name)
+        ) or self.theme != theme
+        
+        self.worktree_info = info
+        self.sync_state = sync_state
+        self.theme = theme
+        self.session_name = session_name
+        
+        if structure_changed:
+            return True
+            
+        try:
+            text_widget = self.query_one(".worktree-text", Static)
+            text_widget.update(_worktree_line(self.worktree_info, self.theme, self.sync_state))
+        except Exception:
+            return True
+        return False
+
+
+class AgentPickerScreen(ModalScreen[str | None]):
+    """Modal listing available agents to pick for a new session."""
+
+    CSS = """
+    AgentPickerScreen {
+        align: center middle;
+    }
+    #agent-picker-dialog {
+        width: 40%;
+        height: auto;
+        border: thick $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    #agent-picker-dialog Static {
+        height: auto;
+        margin-bottom: 1;
+        content-align: center middle;
+    }
+    #agent-picker-dialog Button {
+        width: 100%;
+        margin-bottom: 1;
+    }
+    #agent-picker-dialog Horizontal {
+        height: auto;
+        margin-top: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="agent-picker-dialog"):
+            yield Static("[bold]Launch New Agent[/bold]\nSelect an agent CLI to start:", markup=True)
+            for agent in AGENT_BINARIES:
+                yield Button(agent, id=f"agent-{agent}")
+            with Horizontal():
+                yield Button("Cancel", id="cancel", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed):
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        elif event.button.id and event.button.id.startswith("agent-"):
+            agent_name = event.button.id.removeprefix("agent-")
+            self.dismiss(agent_name)
+
+
+class FolderPickerScreen(ModalScreen[Path | None | bool]):
+    """Modal showing a directory tree to pick a folder for scoping the agent's work."""
+
+    CSS = """
+    FolderPickerScreen {
+        align: center middle;
+    }
+    #folder-picker-dialog {
+        width: 70%;
+        height: 80%;
+        border: thick $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    #folder-picker-dialog Static {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #folder-picker-dialog DirectoryTree {
+        height: 1fr;
+        border: solid $primary-darken-2;
+        background: $panel;
+        margin-bottom: 1;
+    }
+    #folder-picker-dialog Horizontal {
+        height: auto;
+        align: right middle;
+    }
+    #folder-picker-dialog Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("w", "select_whole", "Whole repo"),
+        Binding("s", "select_highlighted", "Scope to folder"),
+    ]
+
+    def __init__(self, repo_root: Path):
+        super().__init__()
+        self.repo_root = repo_root
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="folder-picker-dialog"):
+            yield Static("[bold]Select Scoped Folder[/bold]\nChoose a directory to scope the agent's work, or select 'Whole repo':", markup=True)
+            yield DirectoryTree(str(self.repo_root), id="folder-tree")
+            with Horizontal():
+                yield Button("Cancel (Esc)", id="cancel", variant="error")
+                yield Button("Whole repo (W)", id="whole-repo", variant="default")
+                yield Button("Scope to highlighted (S)", id="confirm", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#folder-tree", DirectoryTree).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "cancel":
+            self.dismiss(False)
+        elif event.button.id == "whole-repo":
+            self.dismiss(None)
+        elif event.button.id == "confirm":
+            self.action_select_highlighted()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def action_select_whole(self) -> None:
+        self.dismiss(None)
+
+    def action_select_highlighted(self) -> None:
+        try:
+            tree = self.query_one("#folder-tree", DirectoryTree)
+            node = tree.cursor_node
+        except Exception:
+            self.dismiss(None)
+            return
+
+        if node and node.data:
+            path = node.data.path
+            if path.is_file():
+                path = path.parent
+            try:
+                rel_path = path.relative_to(self.repo_root)
+                if str(rel_path) == "." or str(rel_path) == "":
+                    self.dismiss(None)
+                else:
+                    self.dismiss(rel_path)
+            except ValueError:
+                self.dismiss(None)
+        else:
+            self.dismiss(None)
+
+
+class BranchesScreen(Screen[None], inherit_bindings=False):
     """Full-screen overview of every currently-running worktree/branch for the watched repo --
     the main working tree plus every agent worktree (see worktree_manager.list_agent_worktrees) --
     a live snapshot, re-queried on an interval while open since a listed agent session can end
@@ -545,16 +746,38 @@ class BranchesScreen(Screen[None]):
     BranchesScreen #branches-list {
         padding: 1 2;
     }
-    BranchesScreen #branches-list Static {
+    BranchesScreen #branches-list ListItem {
         height: auto;
         margin-bottom: 1;
+        padding: 0 1;
+    }
+    BranchesScreen #branches-list ListItem Horizontal {
+        height: auto;
+        align: left middle;
+    }
+    BranchesScreen #branches-list ListItem .worktree-text {
+        width: 1fr;
+    }
+    BranchesScreen #branches-list ListItem Button {
+        height: 1;
+        min-height: 1;
+        border: none;
+        padding: 0 1;
+        margin-left: 2;
+        width: auto;
     }
     """
 
     BINDINGS = [
         Binding("escape", "close", "Back"),
         Binding(BRANCHES_KEY, "close", "Back"),
-        Binding(RETRY_SYNC_KEY, RETRY_SYNC_ACTION, "Retry sync"),
+        Binding("enter", "attach", "Attach"),
+        Binding("n", "new_agent", "New agent"),
+        Binding("q", "quit", "Quit"),
+        Binding(TOGGLE_HISTORY_KEY, TOGGLE_HISTORY_ACTION, "Load history", show=False),
+        Binding(CLEAR_CACHE_KEY, CLEAR_CACHE_ACTION, "Clear cache", show=False),
+        Binding(IGNORE_EDITOR_KEY, IGNORE_EDITOR_ACTION, "Edit ignore", show=False),
+        Binding("g", "show_graph", "Graph", show=False),
     ]
 
     def __init__(self, repo_root: Path):
@@ -563,7 +786,7 @@ class BranchesScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield VerticalScroll(id="branches-list")
+        yield ListView(id="branches-list")
         yield Footer()
 
     def on_mount(self):
@@ -573,35 +796,126 @@ class BranchesScreen(Screen[None]):
         self.set_interval(BRANCHES_REFRESH_SECONDS, self._refresh)
 
     def _refresh(self):
-        """Re-queries live worktrees and re-renders the list from scratch -- cheap at the scale of
-        a handful of concurrent agent sessions, so no need to diff against the previous render.
-        Each entry's sync status comes from the app's own live WorktreeSyncState tracking (see
-        EditWatcherApp._worktree_states), not from disk -- there's nothing on disk that says
-        "paused"."""
+        """Re-queries live worktrees and updates the list view, avoiding clearing/recreating
+        items if their paths haven't changed to prevent flickering."""
         worktrees = list_agent_worktrees(self.repo_root)
-        container = self.query_one("#branches-list", VerticalScroll)
-        container.remove_children()
+        list_view = self.query_one("#branches-list", ListView)
+        
+        current_children = list_view.children
+        has_placeholder = len(current_children) == 1 and not isinstance(current_children[0], WorktreeItem)
+        
         if not worktrees:
-            container.mount(Static("[dim]No worktrees found.[/dim]", markup=True))
+            if has_placeholder:
+                return
+            list_view.clear()
+            list_view.append(ListItem(Static("[dim]No worktrees found.[/dim]", markup=True)))
             return
-        for info in worktrees:
-            sync_state = self.app.worktree_states.get(info.path)
-            container.mount(
-                Static(
-                    _worktree_line(info, self.app.current_theme, sync_state),
-                    markup=True,
+            
+        if has_placeholder:
+            list_view.clear()
+            current_children = []
+            
+        # Get the paths of current items
+        current_worktree_items = [item for item in current_children if isinstance(item, WorktreeItem)]
+        current_paths = [item.worktree_info.path for item in current_worktree_items]
+        new_paths = [info.path for info in worktrees]
+        
+        # If the set of paths or their order has changed, we rebuild the list
+        if current_paths != new_paths:
+            old_index = list_view.index
+            list_view.clear()
+            for info in worktrees:
+                sync_state = self.app.worktree_states.get(info.path)
+                session_name = self.app._tui_sessions.get(info.path)
+                list_view.append(
+                    WorktreeItem(info, sync_state, self.app.current_theme, session_name)
                 )
-            )
+            if old_index is not None and old_index < len(worktrees):
+                list_view.index = old_index
+            elif worktrees:
+                list_view.index = 0
+        else:
+            # The paths are identical in order! We can update each item in-place.
+            # If any item signals it needs layout recreation (due to button presence/theme change),
+            # we rebuild the list.
+            needs_rebuild = False
+            for item, info in zip(current_worktree_items, worktrees):
+                sync_state = self.app.worktree_states.get(info.path)
+                session_name = self.app._tui_sessions.get(info.path)
+                if item.update_state(info, sync_state, self.app.current_theme, session_name):
+                    needs_rebuild = True
+            
+            if needs_rebuild:
+                old_index = list_view.index
+                list_view.clear()
+                for info in worktrees:
+                    sync_state = self.app.worktree_states.get(info.path)
+                    session_name = self.app._tui_sessions.get(info.path)
+                    list_view.append(
+                        WorktreeItem(info, sync_state, self.app.current_theme, session_name)
+                    )
+                if old_index is not None and old_index < len(worktrees):
+                    list_view.index = old_index
+                elif worktrees:
+                    list_view.index = 0
 
     def action_close(self):
         self.dismiss(None)
 
-    def action_retry_paused(self):
-        """Re-dispatches sync for every currently-paused worktree -- stands in for full in-UI
-        conflict resolution (see WORKTREE_SYNC_PLAN.md's Conflict handling): the human is expected
-        to have actually resolved whatever caused the conflict (e.g. by hand-editing the worktree
-        or root) before pressing this, same as the doc's pause-for-human path assumes."""
-        self.app.retry_paused_worktrees()
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        selected_item = event.item
+        if not isinstance(selected_item, WorktreeItem):
+            return
+        session_name = selected_item.session_name
+        if session_name:
+            with self.app.suspend():
+                subprocess.run(["tmux", "-L", "octo", "attach-session", "-t", session_name], check=False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-attach":
+            event.stop()
+            ancestor = event.button.parent
+            while ancestor is not None and not isinstance(ancestor, WorktreeItem):
+                ancestor = ancestor.parent
+            if ancestor is None:
+                return
+            session_name = ancestor.session_name
+            if session_name:
+                with self.app.suspend():
+                    subprocess.run(["tmux", "-L", "octo", "attach-session", "-t", session_name], check=False)
+
+    def action_attach(self):
+        list_view = self.query_one("#branches-list", ListView)
+        if list_view.index is None or list_view.index >= len(list_view.children):
+            return
+        selected_item = list_view.children[list_view.index]
+        if not isinstance(selected_item, WorktreeItem):
+            return
+        session_name = selected_item.session_name
+        if not session_name:
+            return  # not attachable
+        with self.app.suspend():
+            subprocess.run(["tmux", "-L", "octo", "attach-session", "-t", session_name], check=False)
+
+    @work
+    async def action_new_agent(self):
+        agent = await self.app.push_screen_wait(AgentPickerScreen())
+        if not agent:
+            return
+        
+        folder_res = await self.app.push_screen_wait(FolderPickerScreen(self.repo_root))
+        if folder_res is False:
+            return  # Cancelled
+            
+        subpath = str(folder_res) if folder_res else None
+        
+        from agent_launcher import launch_agent_session
+        try:
+            session = launch_agent_session(self.repo_root, agent, subpath=subpath)
+            self.app._tui_sessions[session.handle.path] = session.session_name
+        except Exception as e:
+            self.notify(f"Failed to launch agent: {e}", severity="error")
+        self._refresh()
 
 
 @dataclass
@@ -1082,6 +1396,7 @@ class EditWatcherApp(App):
         self._worktree_states: dict[
             Path, WorktreeSyncState
         ] = {}  # worktree path -> its turn-boundary sync status, seeded on registration, updated by _sync_worktree; read by BranchesScreen
+        self._tui_sessions: dict[Path, str] = {}  # worktree path -> tmux session name for sessions launched via TUI
         self._root_lane = RootLane()  # serializes commit_dirty() against worktree_sync's up-sync file-apply step, since _sync_worktree runs on its own @work worker
         self._repo_root: Path | None = (
             None  # real git repo root behind self.root, resolved lazily on the first worktree registration (self.root need not itself be a git repo)
@@ -1155,13 +1470,42 @@ class EditWatcherApp(App):
         # attribution (via octo run) and desktop notifications; root-lane edits (a claude/codex run
         # directly in the watched tree) are attributed by the transcript tailers below instead.
         results = detect_and_install_hooks(self.root)
+        self._tui_sessions = discover_tui_sessions(self.root)
         self.tailers = build_tailers(self.cwd, self.agent_filter)  # content-match agent tool calls against Human commits each tick
         self.set_interval(POLL_INTERVAL_SECONDS, self.poll_once)
+
+    def on_unmount(self):
+        """Kills any active agent tmux sessions and removes their worktrees on exit."""
+        for path, session_name in list(self._tui_sessions.items()):
+            try:
+                subprocess.run(["tmux", "-L", "octo", "kill-session", "-t", session_name], check=False)
+            except Exception:
+                pass
+            if path.exists():
+                try:
+                    shutil.rmtree(path)
+                except Exception:
+                    pass
 
     def poll_once(self):
         """One drain pass: processes turn-boundary signals (worktree + root-lane), sync events,
         reattributes root-lane agent edits their transcripts now explain, then commits whatever's
         still dirty on disk."""
+        from agent_launcher import list_live_tmux_sessions
+        live_sessions = list_live_tmux_sessions()
+        ended_paths = []
+        for path, session_name in list(self._tui_sessions.items()):
+            if session_name not in live_sessions:
+                if path.exists():
+                    try:
+                        shutil.rmtree(path)
+                    except Exception:
+                        pass
+                ended_paths.append(path)
+        for path in ended_paths:
+            self._tui_sessions.pop(path, None)
+            self._worktree_states.pop(path, None)
+
         for registration in drain_pending_worktrees(self.pid):
             self._render_worktree_registration(registration)
         for turn_ended in drain_pending_turn_ends(self.pid):
@@ -1347,15 +1691,6 @@ class EditWatcherApp(App):
                 or self.file_watcher.get_reverted_commit(s.commit) is not None
             ]
         )
-
-    def retry_paused_worktrees(self):
-        """Re-dispatches sync for every currently-paused worktree this app tracks -- the manual
-        retry BranchesScreen's action_retry_paused triggers, standing in for full in-UI conflict
-        resolution (delegation back to the agent is out of scope for now -- see
-        WORKTREE_SYNC_PLAN.md's Conflict handling)."""
-        for state in self._worktree_states.values():
-            if state.status == "paused":
-                self._sync_worktree(state)
 
     @work
     async def _sync_worktree(self, state: WorktreeSyncState):

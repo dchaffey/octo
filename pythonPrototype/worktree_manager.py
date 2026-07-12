@@ -40,6 +40,8 @@ class WorktreeHandle:
     """One freshly created agent clone."""
     path: Path        # absolute path to the new clone's checkout
     branch: str       # branch name checked out there, unique to this invocation
+    tag: str          # short unique suffix distinguishing this invocation's branch/dir
+    agent_cwd: Path   # cwd for the spawned agent process (subpath-scoped if any)
 
 
 def repo_root(cwd: Path) -> Path:
@@ -101,7 +103,7 @@ def _ensure_agent_dirs_ignored(clone_path: Path):
             f.write(f"{name}/\n")
 
 
-def create_agent_worktree(root: Path, agent_binary: str) -> WorktreeHandle:
+def create_agent_worktree(root: Path, agent_binary: str, subpath: str | None = None) -> WorktreeHandle:
     """Creates a fresh local clone of root's shadow repo (root/.octo -- see module docstring) for
     one agent invocation, checked out on a new branch off its HEAD, under
     WORKTREES_ROOT/<repo slug>/<agent_binary>-<uuid>. A clone (git auto-hardlinks the object store
@@ -123,8 +125,12 @@ def create_agent_worktree(root: Path, agent_binary: str) -> WorktreeHandle:
     subprocess.run(["git", "clone", str(shadow_git_dir), str(clone_path)], capture_output=True, text=True, check=True)
     (clone_path / ".git").rename(clone_path / SHADOW_DIR_NAME)  # drop the clone's `.git` naming entirely -- nothing inside a git-dir depends on its own directory name, so this is a plain, safe move
     _git(clone_path, "checkout", "-b", branch)
+    if subpath:
+        _git(clone_path, "sparse-checkout", "init", "--cone")
+        _git(clone_path, "sparse-checkout", "set", subpath)
     _ensure_agent_dirs_ignored(clone_path)              # ignored inside the clone's own info/exclude, never the real repo's
-    return WorktreeHandle(clone_path, branch)
+    agent_cwd = clone_path / subpath if subpath else clone_path
+    return WorktreeHandle(clone_path, branch, tag, agent_cwd)
 
 
 def write_owner_marker(clone_path: Path, owner_pid: int, root: Path):
@@ -138,12 +144,18 @@ def write_owner_marker(clone_path: Path, owner_pid: int, root: Path):
 
 
 def read_owner_marker(clone_path: Path) -> dict | None:
-    """Reads back the owner info write_owner_marker recorded for clone_path, or None if clone_path
-    carries no marker (e.g. not an octo-managed clone at all)."""
-    marker_path = clone_path / SHADOW_DIR_NAME / OWNER_MARKER_NAME
-    if not marker_path.is_file():
-        return None
-    return json.loads(marker_path.read_text(encoding="utf-8"))
+    """Reads back the owner info write_owner_marker recorded for clone_path by scanning upwards,
+    returning the owner dict extended with 'clone_root' path, or None if not found."""
+    for parent in [clone_path] + list(clone_path.parents):
+        marker_path = parent / SHADOW_DIR_NAME / OWNER_MARKER_NAME
+        if marker_path.is_file():
+            try:
+                owner = json.loads(marker_path.read_text(encoding="utf-8"))
+                owner["clone_root"] = parent
+                return owner
+            except Exception:
+                pass
+    return None
 
 
 @dataclass
