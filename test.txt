@@ -1,3 +1,0 @@
-Here's some new content in the test file.
-This demonstrates the ability to update and modify files.
-You can keep editing this as needed!

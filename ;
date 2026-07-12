@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
 
     const paths = try OctoRepo.resolvePaths(init.io, allocator);
 
-    var octo_repo: OctoRepo = OctoRepo.init(allocator, paths.root, paths.octo_dir);
+    const octo_repo: OctoRepo = OctoRepo.init(allocator, paths.root, paths.octo_dir);
     defer octo_repo.deinit();
 }
 
