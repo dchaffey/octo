@@ -12,9 +12,7 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const paths = try OctoRepo.resolvePaths(init.io, allocator);
-
-    var octo_repo: OctoRepo = OctoRepo.init(allocator, paths.root, paths.octo_dir);
+    var octo_repo: OctoRepo = try OctoRepo.init(init.io, allocator);
     defer octo_repo.deinit();
 }
 

@@ -1,28 +1,50 @@
 const std = @import("std");
-const OctoDirError = error{ NestedDirs, DuplicateDirs };
 
 pub const OctoRepo = struct {
     root: []const u8,
-    octo_dir: []const u8,
+    octo: []const u8,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, root: []const u8, octo_dir: []const u8) OctoRepo {
-        return .{ .root = root, .octo_dir = octo_dir, .allocator = allocator };
+    pub fn init(io: std.Io, allocator: std.mem.Allocator) !OctoRepo {
+        const root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        const octo = try std.fmt.allocPrint(allocator, "{s}/.octo", .{root});
+
+        var repo: OctoRepo = .{ .root = root, .octo = octo, .allocator = allocator };
+
+        if (!try repo.isGitInitialized(io)) {
+            _ = try repo.git(io, &.{ "init", "-q" });
+            _ = try repo.git(io, &.{ "config", "user.name", "octo-watcher" });
+            _ = try repo.git(io, &.{ "config", "user.email", "octo-watcher@local" });
+        }
+        return repo;
     }
 
-    pub fn resolvePaths(io: std.Io, allocator: std.mem.Allocator) !struct { root: [:0]u8, octo_dir: []u8 } {
-        const root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-        const octo_dir = try std.fmt.allocPrint(allocator, "{s}/.octo", .{root});
-        var dir = std.Io.Dir.cwd().openDir(io, ".octo", .{}) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                try std.Io.Dir.cwd().createDir(io, ".octo", std.Io.File.Permissions.default_file);
-                break :blk try std.Io.Dir.cwd().openDir(io, ".octo", .{});
-            },
+    fn isGitInitialized(self: *OctoRepo, io: std.Io) !bool {
+        var dir = std.Io.Dir.cwd().openDir(io, self.octo, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
             else => return err,
         };
-        dir.close(io);
-        return .{ .root = root, .octo_dir = octo_dir };
+        defer dir.close(io);
+        dir.access(io, "HEAD", .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
     }
+
+    pub fn git(self: *OctoRepo, io: std.Io, args: []const []const u8) !std.process.RunResult {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(self.allocator);
+
+        const git_dir_flag = try std.fmt.allocPrint(self.allocator, "--git-dirs={s}", .{self.octo});
+        const git_wtree_flag = try std.fmt.allocPrint(self.allocator, "--work-trees={s}", .{self.root});
+        try argv.appendSlice(self.allocator, &.{ "git", git_dir_flag, git_wtree_flag });
+        try argv.appendSlice(self.allocator, args);
+        const results: std.process.RunResult = try std.process.run(self.allocator, io, .{ .argv = argv.items });
+        std.debug.assert((results.term == .exited and results.term.exited == 0));
+        return results;
+    }
+
     pub fn deinit(self: *OctoRepo) void {
         _ = self;
     }
