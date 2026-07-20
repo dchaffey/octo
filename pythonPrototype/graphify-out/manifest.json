@@ -1,0 +1,82 @@
+{
+  "agent_detection.py": {
+    "mtime": 1783699929.011081,
+    "ast_hash": "a99b997ae406aeebb586ba8382d2367d",
+    "semantic_hash": "a99b997ae406aeebb586ba8382d2367d"
+  },
+  "agent_launcher.py": {
+    "mtime": 1783862579.6621215,
+    "ast_hash": "ea7f8cd97684513e69d71890fd46238f",
+    "semantic_hash": "ea7f8cd97684513e69d71890fd46238f"
+  },
+  "agent_watcher.py": {
+    "mtime": 1783699929.011081,
+    "ast_hash": "9ccb7d51ce9b72e0df46c8bc752e6e65",
+    "semantic_hash": "9ccb7d51ce9b72e0df46c8bc752e6e65"
+  },
+  "commit_graph.py": {
+    "mtime": 1783751443.8234339,
+    "ast_hash": "677f8edf2e131644a0ff508e11f83e13",
+    "semantic_hash": "677f8edf2e131644a0ff508e11f83e13"
+  },
+  "commit_graph_screen.py": {
+    "mtime": 1783751876.9280665,
+    "ast_hash": "d73efc88860901a0e53f99e22e9a2842",
+    "semantic_hash": "d73efc88860901a0e53f99e22e9a2842"
+  },
+  "hook_installer.py": {
+    "mtime": 1783703258.6375754,
+    "ast_hash": "a81abfc370ddfc248daac9879a06fdd4",
+    "semantic_hash": "a81abfc370ddfc248daac9879a06fdd4"
+  },
+  "notifications.py": {
+    "mtime": 1783703240.3605337,
+    "ast_hash": "6b82c950f6e3a88660b52d96156f7e56",
+    "semantic_hash": "6b82c950f6e3a88660b52d96156f7e56"
+  },
+  "octo.py": {
+    "mtime": 1783699929.011081,
+    "ast_hash": "4d5ddb7cb710bf12f5a3582823e7c7f2",
+    "semantic_hash": "4d5ddb7cb710bf12f5a3582823e7c7f2"
+  },
+  "octo_hook.py": {
+    "mtime": 1783862413.0003793,
+    "ast_hash": "c99beccccf84cbf8c44f597b40dad4bd",
+    "semantic_hash": "c99beccccf84cbf8c44f597b40dad4bd"
+  },
+  "octo_tui.py": {
+    "mtime": 1783861071.1849604,
+    "ast_hash": "47835afc5634dbdd3eef15256f2b60d3",
+    "semantic_hash": "47835afc5634dbdd3eef15256f2b60d3"
+  },
+  "root_lane.py": {
+    "mtime": 1783699929.012081,
+    "ast_hash": "12f00dcf3c676a5ddef99270e3d68236",
+    "semantic_hash": "12f00dcf3c676a5ddef99270e3d68236"
+  },
+  "scratch_test.sh": {
+    "mtime": 1783699505.3606076,
+    "ast_hash": "672d6bcbdd7dc1a0a163b9f3d1dfe3af",
+    "semantic_hash": "672d6bcbdd7dc1a0a163b9f3d1dfe3af"
+  },
+  "session_registry.py": {
+    "mtime": 1783702577.439886,
+    "ast_hash": "618ef3e0ce3bfa626520fea3aa018e70",
+    "semantic_hash": "618ef3e0ce3bfa626520fea3aa018e70"
+  },
+  "shadow_repo.py": {
+    "mtime": 1783752931.539963,
+    "ast_hash": "2b8e9292dec3ac742765a0d987eb5a0e",
+    "semantic_hash": "2b8e9292dec3ac742765a0d987eb5a0e"
+  },
+  "worktree_manager.py": {
+    "mtime": 1783862001.5179381,
+    "ast_hash": "f9de50d43fef8d6c0ef07896b59b82c7",
+    "semantic_hash": "f9de50d43fef8d6c0ef07896b59b82c7"
+  },
+  "worktree_sync.py": {
+    "mtime": 1783699929.012081,
+    "ast_hash": "b520d464bddefb1f78eb7e16790cd702",
+    "semantic_hash": "b520d464bddefb1f78eb7e16790cd702"
+  }
+}

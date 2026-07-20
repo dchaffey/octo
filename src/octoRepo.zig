@@ -5,8 +5,7 @@ pub const OctoRepo = struct {
     octo: []const u8,
     allocator: std.mem.Allocator,
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator) !OctoRepo {
-        const root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    pub fn init(io: std.Io, root: []const u8, allocator: std.mem.Allocator) !OctoRepo {
         const octo = try std.fmt.allocPrint(allocator, "{s}/.octo", .{root});
 
         var repo: OctoRepo = .{ .root = root, .octo = octo, .allocator = allocator };
