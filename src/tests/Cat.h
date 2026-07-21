@@ -10,7 +10,7 @@ private:
 public:
     Cat(const std::string& catName, int catAge); // constructor
 
-    void meow() const;      // make the cat meow
+    void meow() const;     // make the cat meow
     std::string getName(); // get cat's name
     int getAge() const;    // get cat's age
 };

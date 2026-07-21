@@ -4,7 +4,26 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{ .name = "octo", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize }) });
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ------------- VAXIS begin -------------
+
+    const vaxis = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("vaxis", vaxis.module("vaxis"));
+
+    // ------------- VAXIS end -------------
+
+    const exe = b.addExecutable(.{
+        .name = "octo",
+        .root_module = exe_mod,
+    });
 
     b.installArtifact(exe);
 
