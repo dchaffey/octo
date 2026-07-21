@@ -7,7 +7,6 @@ main
 zig-pkg/
 
 # Local docs/notes not tracked
-docs/
 digram.canvas
 
 # octo tool's own dogfooded repo state (not the real git history)
